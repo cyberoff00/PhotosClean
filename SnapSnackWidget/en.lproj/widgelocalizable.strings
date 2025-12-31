@@ -1,0 +1,10 @@
+/* 
+  widgelocalizable.strings
+  PhotosClean
+
+  Created by Claire Yang on 15/01/2026.
+  
+*/
+"widget.display.name" = "Tastytidy";
+"widget.description" = "Show the number of unsorted photos today";
+"widget.pending.today" = "Unsorted Photos Today";

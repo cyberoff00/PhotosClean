@@ -1,0 +1,213 @@
+//  Localizable.strings
+//  PhotosClean
+//
+//  Created by Claire Yang on 09/01/2026.
+//
+
+// Localizable.strings (English)
+
+// Header
+"header.title" = "🍪 TastyTidy";
+"header.cleanup" = "Cleanup (%d)";
+
+// Buttons
+"button.delete" = "Delete";
+"button.maybe" = "MAYBE";
+"button.keep" = "KEEP";
+"button.undo" = "Undo";
+
+// Empty State
+"empty.title" = "Tasted";
+"empty.description" = "All photos today have been sorted";
+
+// Swipe Hints
+"hint.keep" = "KEEP";
+"hint.delete" = "DELETE";
+"hint.maybe" = "MAYBE";
+
+// Note Editor
+"note.title" = "Add Note";
+"note.save" = "Save";
+
+// Delete Confirmation
+"delete.confirm" = "Delete all photos marked for deletion?";
+"delete.cancel" = "Cancel";
+"delete.confirm.action" = "Delete All";
+
+//
+/* Library View */
+"library.title" = "All Photos";
+"library.category" = "Category";
+"library.unmarked" = "To Clean";
+"library.favorites" = "Keep";
+"library.maybe" = "Maybe";
+"library.toDelete" = "To Delete";
+"library.retroView" = "Library";
+
+/* PhotoGridView */
+"grid.noPhotos" = "No Photos";
+"grid.deleteConfirm" = "Confirm permanent deletion?";
+"grid.cancel" = "Cancel";
+"grid.deleteAll" = "Delete All";
+/* RetroCleanView */
+"retro.done" = "Done";
+"retro.finished" = "You've finished reviewing all photos";
+"retro.progress" = "%d / %d";
+/* MainTabView */
+"tab.today" = "Today";
+"tab.library" = "Library";
+/* Date Filter */
+"grid.allDates" = "All Dates";
+
+
+
+
+"onb.library.unmarked.hint" = "Review photos that still need cleanup";
+
+"hint.banner.today" = "Quickly sort today’s photos ✨";
+"hint.banner.today.empty" = "No new photos today — check Library anytime.";
+"hint.gesture.today" = "Swipe left / right / up to sort";
+
+
+// Localizable.strings (English)
+"share.original" = "Share Original Image";
+"share.with.note" = "Share with Note";
+
+
+
+/* ============================================
+   SUBSCRIPTION VIEW LOCALIZABLE STRINGS
+   ============================================ */
+
+/* ============================================
+   UNSUBSCRIBED VIEW
+   ============================================ */
+
+// Title and description when not subscribed
+"sub.premium" = "Activate Premium";
+"sub.premium.active" = "Premium Unlocked";
+"sub.title" = "Upgrade to Premium";
+"sub.subtitle" = "Unlock all features and enjoy full potential";
+
+// Feature list
+"sub.feature.unlimited" = "Unlimited assess to all features";
+"sub.feature.history" = "Complete history and statistics";
+"sub.feature.privacy" = "100% private, no ads";
+
+// Monthly plan
+"sub.plan.monthly.title" = "Monthly";
+"sub.plan.monthly.subtitle" = "%@ / month";
+
+// Quarterly plan
+"sub.plan.quarterly.title" = "Quarterly";
+"sub.plan.quarterly.subtitle" = "%@ / 3 months";
+
+// Lifetime plan
+"sub.plan.yearly.title" = "Yearly";
+"sub.plan.yearly.subtitle" = "%@ / year";
+"sub.cta.then.yearly" = "Then %@ / year";
+"sub.type.yearly" = "Yearly";
+"sub.badge.bestvalue" = "Best Value";
+
+
+// Default plan title
+"sub.plan.default.title" = "Premium";
+
+// Trial badge
+"sub.badge.trial7" = "Free 7-day trial";
+
+// Main CTA button text
+"sub.cta.subscribe" = "Subscribe";
+"sub.cta.trial7" = "Start Free Trial";
+"sub.cta.lifetime" = "Buy Lifetime";
+
+// Secondary CTA (renewal information)
+"sub.cta.lifetime.detail" = "Pay once, keep forever";
+"sub.cta.then.monthly" = "Then %@ / month";
+"sub.cta.then.quarterly" = "Then %@ / 3 months";
+
+/* ============================================
+   SUBSCRIBED VIEW
+   ============================================ */
+
+// Title and description when subscribed
+"sub.title.subscribed" = "Premium Active";
+"sub.subtitle.subscribed" = "Thank you for supporting us!";
+
+// Subscription types
+"sub.type.monthly" = "Monthly";
+"sub.type.quarterly" = "Quarterly";
+"sub.type.lifetime" = "Lifetime";
+
+// Action buttons
+"sub.manage.subscription" = "Manage Subscription";
+
+
+/* ============================================
+   COMMON
+   ============================================ */
+
+// Restore purchase
+"sub.restore" = "Restore Purchases";
+
+// Legal links
+"sub.privacy" = "Privacy Policy";
+"sub.terms" = "Terms of Service";
+
+"grid.selection.cancel" = "Cancel Select";
+
+"grid.deleteSelectedConfirm" = "Delete selected photos permanently?";
+
+"grid.batchNote" = "Add Note";
+"grid.batchNote.title" = "Add a note to selected photos";
+"grid.batchNote.placeholder" = "Type a note to append…";
+"grid.batchNote.footer" = "Existing notes won’t be replaced; your text will be appended with a semicolon.";
+"grid.batchNote.add" = "Add";
+
+"grid.deleteSelected" = "Delete";
+
+// Date Source Switch
+"filter.today" = "Today";
+"filter.random" = "Random date";
+"filter.random_date" = "Random: %@";
+
+/* Common */
+"app.name" = "Tastytidy";
+"common.cancel" = "Cancel";
+"common.preview" = "Preview";
+"common.share" = "Share";
+
+/* AI Clean */
+"ai.category.blurry" = "Blurry Photos";
+"ai.category.screenshots" = "Screenshots";
+"ai.category.duplicates" = "Possible Duplicates";
+"ai.category.blurry.desc" = "Quickly find low-clarity photos (on-device, scans recent 500 by default).";
+"ai.category.screenshots.desc" = "System-detected screenshots (stable recognition).";
+"ai.category.duplicates.desc" = "Coarse grouping by capture time + size to find possible duplicates.";
+"ai.picker.header" = "Choose Category";
+"ai.picker.footer" = "All recognition runs on-device and never uploads your photos. Please review results manually.";
+"ai.empty.title" = "No Results";
+"ai.empty.description" = "No matching photos found.";
+"ai.progress.scan800" = "Scanning recent 800 photos...";
+"ai.progress.scan500" = "Analyzing recent 500 photos...";
+"ai.progress.analyzing" = "Analyzing... %d/%d";
+"ai.progress.identifying" = "Identifying...";
+
+/* Grid */
+"grid.filter.all" = "All";
+"grid.filter.ai" = "AI";
+"grid.ai.append500" = "Append Scan (+500)";
+"grid.ai.progress.blurry" = "Identifying blurry... %d-%d/%d";
+"grid.ai.progress.duplicates" = "Identifying duplicates... %d-%d/%d";
+
+/* Subscription */
+"sub.current.plan" = "Current plan: %@ (%@)";
+
+/* Settings */
+"settings.title" = "Settings";
+"settings.subscription.section" = "Subscription";
+"settings.subscription.title" = "Premium";
+"settings.general.section" = "General";
+"settings.check_update" = "Check for Updates";
+"settings.rate_us" = "Rate Us";
+"settings.legal.section" = "Legal";

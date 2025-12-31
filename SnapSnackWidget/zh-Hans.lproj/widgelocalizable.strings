@@ -1,0 +1,10 @@
+/* 
+  widgelocalizable.strings
+  PhotosClean
+
+  Created by Claire Yang on 15/01/2026.
+  
+*/
+"widget.display.name" = "照片曲奇盒";
+"widget.description" = "显示今日待处理照片数量";
+"widget.pending.today" = "今日待处理";

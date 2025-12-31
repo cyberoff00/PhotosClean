@@ -1,0 +1,195 @@
+/* Localizable.strings (Chinese)
+*/
+
+// Header
+"header.title" = "🍪 曲奇相片";
+"header.cleanup" = "清理 (%d)";
+
+// Buttons
+"button.delete" = "删除";
+"button.maybe" = "待定";
+"button.keep" = "保留";
+"button.undo" = "撤销";
+
+// Empty State
+"empty.title" = "已完成";
+"empty.description" = "今日的照片已经全部处理完啦";
+
+// Swipe Hints
+"hint.keep" = "保留";
+"hint.delete" = "删除";
+"hint.maybe" = "稍后";
+
+// Note Editor
+"note.title" = "添加备注";
+"note.save" = "保存";
+
+// Delete Confirmation
+"delete.confirm" = "将待删区的照片全部从相册清除？";
+"delete.cancel" = "取消";
+"delete.confirm.action" = "全部删除";
+
+/* Library View */
+"library.title" = "全部照片";
+"library.category" = "分类";
+"library.unmarked" = "待清理照片";
+"library.favorites" = "保留";
+"library.maybe" = "待定";
+"library.toDelete" = "待删除";
+"library.retroView" = "图库";
+
+/* PhotoGridView */
+"grid.noPhotos" = "无照片";
+"grid.deleteConfirm" = "确认彻底删除？";
+"grid.cancel" = "取消";
+"grid.deleteAll" = "全部删除";
+
+/* RetroCleanView */
+"retro.done" = "完成";
+"retro.finished" = "已经刷完啦";
+"retro.progress" = "%d / %d";
+
+/* MainTabView */
+"tab.today" = "今日照片";
+"tab.library" = "图库";
+
+/* Date Filter */
+"grid.allDates" = "全部日期";
+
+// Hints & Onboarding
+"onb.library.unmarked.hint" = "进入待清理照片，快速整理";
+"hint.banner.today" = "今天的照片建议及时处理 ✨";
+"hint.banner.today.empty" = "今天没有新照片，随时去图库整理～";
+"hint.gesture.today" = "左右 / 上滑即可分类";
+
+/* ===== Tiny hints (one-line, no box) ===== */
+"hint.toast.undo" = "点这里撤销上一张";
+"hint.toast.note" = "可添加笔记，方便以后回忆";
+"tip.search" = "你可以为每张照片写备注，并在这里搜索";
+"tip.delete" = "将待删区照片从手机清除";
+"tip.swipe" = "快速清理历史照片";
+
+// Share
+"share.original" = "分享原图";
+"share.with.note" = "分享带笔记版本";
+
+
+/* ============================================
+   订阅视图 (Subscription View)
+   ============================================ */
+
+/* --- 未订阅状态 --- */
+"sub.title" = "升级至高级版本";
+"sub.subtitle" = "解锁所有功能，享受完整体验";
+
+// 功能列表
+"sub.feature.unlimited" = "无限制使用所有功能";
+"sub.feature.history" = "完整的历史记录和统计数据";
+"sub.feature.privacy" = "100% 隐私保护，无广告";
+
+// 方案选择
+"sub.plan.monthly.title" = "月付";
+"sub.plan.monthly.subtitle" = "%@ / 月";
+"sub.plan.quarterly.title" = "季付";
+"sub.plan.quarterly.subtitle" = "%@ / 3 个月";
+"sub.plan.yearly.title" = "年付";
+"sub.plan.yearly.subtitle" = "%@ / 年";
+"sub.cta.then.yearly" = "Then %@ / 年";
+"sub.type.yearly" = "年付";
+"sub.badge.bestvalue" = "性价比高";
+
+"sub.plan.default.title" = "高级版本";
+
+// 标签与按钮
+"sub.badge.trial7" = "免费试用 7 天";
+"sub.cta.subscribe" = "立即订阅";
+"sub.cta.trial7" = "开始免费试用";
+"sub.cta.lifetime" = "购买终身版本";
+
+// 续订/详细描述
+"sub.cta.then.monthly" = "之后 %@ / 月";
+"sub.cta.then.quarterly" = "之后 %@ / 3 个月";
+
+/* --- 已订阅状态 --- */
+"sub.title.subscribed" = "高级版本已激活";
+"sub.subtitle.subscribed" = "感谢您的支持！";
+
+// 订阅详情
+"sub.info.status" = "状态";
+"sub.info.active" = "已激活";
+"sub.info.plan" = "当前方案";
+"sub.info.renew" = "下次续订";
+
+// 订阅类型映射
+"sub.type.monthly" = "月付";
+"sub.type.quarterly" = "季付";
+"sub.type.lifetime" = "终身";
+
+// 操作
+"sub.manage.subscription" = "管理订阅";
+"sub.change.plan" = "更改方案";
+
+/* --- 通用 & 法律 --- */
+"sub.restore" = "恢复购买";
+"sub.privacy" = "隐私政策";
+"sub.terms" = "服务条款";
+"sub.premium.active" = "高级版已解锁";
+"sub.premium" = "开通高级版";
+
+"grid.selection.cancel" = "取消多选";
+
+"grid.deleteSelectedConfirm" = "确认彻底删除所选照片？";
+
+"grid.batchNote" = "批量添加备注";
+"grid.batchNote.title" = "将备注添加到所选照片";
+"grid.batchNote.placeholder" = "输入要添加的备注…";
+"grid.batchNote.footer" = "不会覆盖原有备注；会用分号追加到末尾。";
+"grid.batchNote.add" = "添加";
+
+"grid.deleteSelected" = "删除";
+
+// 日期来源切换
+"filter.today" = "今天";
+"filter.random" = "随机日期";
+"filter.random_date" = "随机：%@";
+
+/* Common */
+"app.name" = "曲奇相片";
+"common.cancel" = "取消";
+"common.preview" = "预览";
+"common.share" = "分享";
+
+/* AI Clean */
+"ai.category.blurry" = "模糊照片";
+"ai.category.screenshots" = "截图";
+"ai.category.duplicates" = "可能重复";
+"ai.category.blurry.desc" = "快速识别清晰度较低的照片（本地分析，默认只扫描最近 500 张以保证速度）";
+"ai.category.screenshots.desc" = "系统标记的截图（识别稳定）";
+"ai.category.duplicates.desc" = "按拍摄时间+尺寸做粗筛，找出“可能重复”的组（结果为可能项，可人工确认）";
+"ai.picker.header" = "选择组别";
+"ai.picker.footer" = "所有识别都在本地完成，不会上传你的照片。“可能重复/模糊”属于启发式结果，建议进入后再人工确认。";
+"ai.empty.title" = "暂无结果";
+"ai.empty.description" = "没有找到符合条件的照片";
+"ai.progress.scan800" = "正在扫描最近 800 张…";
+"ai.progress.scan500" = "正在分析最近 500 张…";
+"ai.progress.analyzing" = "正在分析… %d/%d";
+"ai.progress.identifying" = "正在识别…";
+
+/* Grid */
+"grid.filter.all" = "全部";
+"grid.filter.ai" = "AI";
+"grid.ai.append500" = "追加识别（+500）";
+"grid.ai.progress.blurry" = "正在识别模糊… %d-%d/%d";
+"grid.ai.progress.duplicates" = "正在识别重复… %d-%d/%d";
+
+/* Subscription */
+"sub.current.plan" = "当前方案：%@（%@）";
+
+/* 设置 */
+"settings.title" = "设置";
+"settings.subscription.section" = "订阅";
+"settings.subscription.title" = "高级版";
+"settings.general.section" = "通用";
+"settings.check_update" = "检查更新";
+"settings.rate_us" = "给我们评分";
+"settings.legal.section" = "法律";

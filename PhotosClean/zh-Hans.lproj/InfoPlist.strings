@@ -1,0 +1,9 @@
+/* 
+  InfoPlist.strings
+  PhotosClean
+
+  Created by Claire Yang on 15/01/2026.
+  
+*/
+"NSPhotoLibraryUsageDescription" = "我们需要访问你的相册，以帮助你整理和分类照片。";
+"CFBundleDisplayName" = "曲奇相片";

@@ -1,0 +1,10 @@
+/* 
+  InfoPlist.strings
+  PhotosClean
+
+  Created by Claire Yang on 15/01/2026.
+  
+*/
+"NSPhotoLibraryUsageDescription" = "We need access to your photo library to help you organize photos.";
+
+    "CFBundleDisplayName" = "TastyTidy";
