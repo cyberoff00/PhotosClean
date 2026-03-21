@@ -36,6 +36,7 @@ struct PhotoGridView: View {
     @State private var isLoading = true
     @State private var searchText = ""
     @State private var showingDeleteConfirm = false
+    @State private var cachedYearsMonths: [String] = []
 
     // 日期过滤
     @State private var selectedYear: Int?
@@ -123,10 +124,12 @@ struct PhotoGridView: View {
             }
             .onChange(of: allTags) { _ in
                 rebuildTagMaps()
+                // applyStatusFilterFromSnapshot updates `assets` AND calls recomputeFilteredAssets
+                // in one shot, so we do NOT need a separate onChange(of: assets) listener.
                 applyStatusFilterFromSnapshot()
-                recomputeFilteredAssets()
             }
-            .onChange(of: assets) { _ in recomputeFilteredAssets() }
+            // Removed: onChange(of: assets) → was causing a second cascade since
+            // applyStatusFilterFromSnapshot already mutates assets AND recomputes.
             .onChange(of: searchText) { _ in recomputeFilteredAssets() }
             .onChange(of: selectedYear) { _ in recomputeFilteredAssets() }
             .onChange(of: selectedMonth) { _ in recomputeFilteredAssets() }
@@ -149,15 +152,7 @@ struct PhotoGridView: View {
         GeometryReader { outerGeo in
             ScrollViewReader { proxy in
                 ZStack {
-                    gridScrollBody
-                        .scrollDisabled(isDragSelecting)
-                        .coordinateSpace(name: "gridSpace")
-                        .onPreferenceChange(CellFramePreferenceKey.self) { cellFrames = $0 }
-                        .simultaneousGesture(dragSelectGesture(outerGeo: outerGeo))
-                        .onReceive(autoScrollTimer) { _ in
-                            guard isSelectionMode, isDragSelecting, autoScrollDirection != 0 else { return }
-                            autoScrollTick(with: proxy)
-                        }
+                    gridBodyWithOptionalSelectionGesture(outerGeo: outerGeo, proxy: proxy)
                     if aiIsScanning {
                         aiProgressOverlay
                     }
@@ -184,6 +179,28 @@ struct PhotoGridView: View {
                 }
                 .padding(.horizontal, 2)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func gridBodyWithOptionalSelectionGesture(
+        outerGeo: GeometryProxy,
+        proxy: ScrollViewProxy
+    ) -> some View {
+        if isSelectionMode {
+            gridScrollBody
+                .scrollDisabled(isDragSelecting)
+                .coordinateSpace(name: "gridSpace")
+                .onPreferenceChange(CellFramePreferenceKey.self) { cellFrames = $0 }
+                .simultaneousGesture(dragSelectGesture(outerGeo: outerGeo))
+                .onReceive(autoScrollTimer) { _ in
+                    guard isDragSelecting, autoScrollDirection != 0 else { return }
+                    autoScrollTick(with: proxy)
+                }
+        } else {
+            // ✅ Non-selection: plain ScrollView, NO scrollDisabled, NO gestures.
+            // This fixes older iOS where SwiftUI gesture arbitration blocks scrolling.
+            gridScrollBody
         }
     }
 
@@ -279,8 +296,8 @@ struct PhotoGridView: View {
             } else {
                 if filterStatus != "delete" {
                     aiFilterMenu
+                    dateFilterMenu
                 }
-                dateFilterMenu
                 if filterStatus == "delete" {
                     deleteMenuButton
                 }
@@ -339,7 +356,7 @@ struct PhotoGridView: View {
                 }
             }
             Divider()
-            ForEach(getAvailableYearsMonths(), id: \.self) { dateStr in
+            ForEach(cachedYearsMonths, id: \.self) { dateStr in
                 Button(action: {
                     let parts = dateStr.split(separator: "-").map { Int($0) ?? 0 }
                     selectedYear = parts[0]
@@ -418,44 +435,53 @@ struct PhotoGridView: View {
         let note = noteByAssetID[id]
         let matchesSearch = !searchText.isEmpty && (note?.localizedCaseInsensitiveContains(searchText) ?? false)
 
-        ZStack(alignment: .topTrailing) {
-            AssetThumbnailView(asset: asset, noteText: note, isSearchMatched: matchesSearch)
-                .overlay(
-                    Rectangle()
-                        .strokeBorder(isSelectionMode && selectedIDs.contains(id) ? Color.accentColor : Color.clear, lineWidth: 3)
-                )
-                .contentShape(Rectangle())
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.preference(
-                            key: CellFramePreferenceKey.self,
-                            value: [id: geo.frame(in: .named("gridSpace"))]
-                        )
-                    }
-                )
+        if isSelectionMode {
+            // Selection mode: show border, checkmark, geometry tracking
+            let isSelected = selectedIDs.contains(id)
+            ZStack(alignment: .topTrailing) {
+                AssetThumbnailView(asset: asset, noteText: note, isSearchMatched: matchesSearch)
+                    .overlay(
+                        Rectangle()
+                            .strokeBorder(isSelected ? Color.accentColor : Color.clear, lineWidth: 3)
+                    )
+                    .contentShape(Rectangle())
+                    .background(selectionTrackingBackground(for: id))
 
-            if isSelectionMode {
-                Image(systemName: selectedIDs.contains(id) ? "checkmark.circle.fill" : "circle")
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
-                    .foregroundColor(selectedIDs.contains(id) ? .accentColor : .white.opacity(0.85))
+                    .foregroundColor(isSelected ? .accentColor : .white.opacity(0.85))
                     .padding(6)
             }
+            .id(id)
+            .onTapGesture { toggleSelection(id) }
+        } else {
+            // Normal mode: lightweight, no overlays, no geometry tracking
+            AssetThumbnailView(asset: asset, noteText: note, isSearchMatched: matchesSearch)
+                .contentShape(Rectangle())
+                .id(id)
+                .onTapGesture {
+                    navigationSnapshot = filteredAssets
+                    selected = SelectedPhoto(id: id)
+                }
+                .onLongPressGesture(minimumDuration: 0.25) {
+                    isSelectionMode = true
+                    selectedIDs.insert(id)
+                    pendingDragAddsOverride = true
+                }
         }
-        .id(id)
-        .onTapGesture {
-            if isSelectionMode {
-                toggleSelection(id)
-            } else {
-                navigationSnapshot = filteredAssets
-                selected = SelectedPhoto(id: id)
+    }
+
+    @ViewBuilder
+    private func selectionTrackingBackground(for id: String) -> some View {
+        if isSelectionMode {
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: CellFramePreferenceKey.self,
+                    value: [id: geo.frame(in: .named("gridSpace"))]
+                )
             }
-        }
-        .onLongPressGesture(minimumDuration: 0.25) {
-            if !isSelectionMode {
-                isSelectionMode = true
-            }
-            selectedIDs.insert(id)
-            pendingDragAddsOverride = true
+        } else {
+            Color.clear
         }
     }
 
@@ -480,6 +506,7 @@ struct PhotoGridView: View {
         pendingDragAddsOverride = nil
         dragMode = .undecided
         dragStartPoint = nil
+        cellFrames = [:]
     }
 
     private func applyBatchNote() {
@@ -607,12 +634,26 @@ struct PhotoGridView: View {
     }
 
 
-    // 获取所有可用的年月组合
-    private func getAvailableYearsMonths() -> [String] {
+    private func prefetchInitialThumbnails() {
+        let batch = Array(filteredAssets.prefix(60))
+        guard !batch.isEmpty else { return }
+        let targetSize = gridThumbnailTargetSize()
+        PHAssetThumbnailLoader.shared.startPrefetching(batch, targetSize: targetSize)
+    }
+
+    private func gridThumbnailTargetSize() -> CGSize {
+        let scale = UIScreen.main.scale
+        let gridSide = ((UIScreen.main.bounds.width - 8) / 3.0).rounded(.up)
+        let pixelSide = max(gridSide * scale, 180)
+        return CGSize(width: pixelSide, height: pixelSide)
+    }
+
+    // 获取所有可用的年月组合（预计算缓存，不在 body 里调用）
+    private func buildAvailableYearsMonths(from source: [PHAsset]) -> [String] {
         var dateStrings: Set<String> = []
         let calendar = Calendar.current
 
-        for asset in assets {
+        for asset in source {
             let components = calendar.dateComponents([.year, .month], from: asset.creationDate ?? Date())
             if let year = components.year, let month = components.month {
                 dateStrings.insert("\(year)-\(String(format: "%02d", month))")
@@ -638,6 +679,8 @@ struct PhotoGridView: View {
 
     private func applyStatusFilterFromSnapshot() {
         assets = applyStatusFilter(to: allAssetsSnapshot, statusByAssetID: statusByAssetID)
+        cachedYearsMonths = buildAvailableYearsMonths(from: assets)
+        recomputeFilteredAssets()
     }
 
     private func applyStatusFilter(to source: [PHAsset], statusByAssetID: [String: String]) -> [PHAsset] {
@@ -687,8 +730,12 @@ struct PhotoGridView: View {
             result = result.filter { allow.contains($0.localIdentifier) }
         }
 
-        filteredAssetsCache = result
-        filteredAssetIDs = result.map(\.localIdentifier)
+        // Avoid SwiftUI diff if the identity list hasn't actually changed.
+        let newIDs = result.map(\.localIdentifier)
+        if newIDs != filteredAssetIDs {
+            filteredAssetsCache = result
+            filteredAssetIDs = newIDs
+        }
     }
 
     func loadPhotos() {
@@ -707,7 +754,10 @@ struct PhotoGridView: View {
                 self.allAssetsSnapshot = snapshot
                 self.assets = self.applyStatusFilter(to: snapshot, statusByAssetID: self.statusByAssetID)
                 self.isLoading = false
+                self.cachedYearsMonths = self.buildAvailableYearsMonths(from: self.assets)
                 self.recomputeFilteredAssets()
+                // Pre-warm thumbnail cache for first batch of visible photos
+                self.prefetchInitialThumbnails()
             }
         }
     }
@@ -978,23 +1028,20 @@ struct AssetThumbnailView: View {
         ZStack(alignment: .topLeading) {
             GeometryReader { geo in
                 ZStack {
-                    // ✅ 占位别太淡：模拟器拿不到图时也能看见“格子存在”
                     Rectangle().fill(Color.gray.opacity(0.20))
 
                     if let image = thumbnail {
                         Image(uiImage: image)
                             .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: geo.size.width, height: geo.size.width)
+                            .scaledToFill()
+                            .frame(width: geo.size.width, height: geo.size.height)
                             .clipped()
                     } else {
-                        // 可选：给一个图标帮助你快速感知“没拿到图”
                         Image(systemName: "photo")
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.secondary.opacity(0.6))
                     }
                 }
-                .frame(width: geo.size.width, height: geo.size.width)
             }
             .aspectRatio(1, contentMode: .fit)
 
@@ -1039,10 +1086,7 @@ struct AssetThumbnailView: View {
         PHAssetThumbnailLoader.shared.cancel(requestID)
         requestID = PHInvalidImageRequestID
 
-        // ✅ targetSize 用屏幕 scale，更稳更清晰
-        let scale = UIScreen.main.scale
-        let side = 200.0 * scale
-        let targetSize = CGSize(width: side, height: side)
+        let targetSize = gridThumbnailTargetSize()
 
         // 先用缓存立即显示（如果有）
         if let cached = PHAssetThumbnailLoader.shared.cachedImage(for: asset.localIdentifier, targetSize: targetSize) {
@@ -1065,5 +1109,12 @@ struct AssetThumbnailView: View {
         let m = Int(duration) / 60
         let s = Int(duration) % 60
         return String(format: "%d:%02d", m, s)
+    }
+
+    private func gridThumbnailTargetSize() -> CGSize {
+        let scale = UIScreen.main.scale
+        let gridSide = ((UIScreen.main.bounds.width - 8) / 3.0).rounded(.up)
+        let pixelSide = max(gridSide * scale, 180)
+        return CGSize(width: pixelSide, height: pixelSide)
     }
 }

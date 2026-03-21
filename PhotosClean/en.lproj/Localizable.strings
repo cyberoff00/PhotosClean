@@ -150,6 +150,11 @@
 // Restore purchase
 "sub.restore" = "Restore Purchases";
 
+// Load failed
+"sub.load.failed.title" = "Unable to load subscription plans";
+"sub.load.failed.hint" = "Please check your network connection and try again. If you're using a VPN, try disabling it — your App Store region must match your Apple ID region.";
+"sub.load.failed.retry" = "Retry";
+
 // Legal links
 "sub.privacy" = "Privacy Policy";
 "sub.terms" = "Terms of Service";
@@ -168,8 +173,14 @@
 
 // Date Source Switch
 "filter.today" = "Today";
+"filter.day" = "Day";
+"filter.week" = "Week";
+"filter.month" = "Month";
 "filter.random" = "Random date";
 "filter.random_date" = "Random: %@";
+"random.empty.title" = "This day is done";
+"random.empty.description" = "Pick another random day and keep going.";
+"random.empty.cta" = "Another batch";
 
 /* Common */
 "app.name" = "Tastytidy";

@@ -86,7 +86,12 @@ struct SubscriptionView: View {
         .onAppear {
             guard !hasInitialized else { return }
             hasInitialized = true
-            Task { await storeManager.updatePurchasedProducts() }
+            Task {
+                if storeManager.products.isEmpty {
+                    await storeManager.fetchProducts()
+                }
+                await storeManager.updatePurchasedProducts()
+            }
         }
     }
 
@@ -163,7 +168,36 @@ struct SubscriptionView: View {
             Spacer()
 
             // Plans
-            if products.isEmpty {
+            if products.isEmpty && storeManager.productLoadFailed {
+                // Load failed hint
+                VStack(spacing: 14) {
+                    Image(systemName: "wifi.exclamationmark")
+                        .font(.system(size: 32))
+                        .foregroundColor(.secondary)
+
+                    Text("sub.load.failed.title")
+                        .font(.subheadline.bold())
+                        .multilineTextAlignment(.center)
+
+                    Text("sub.load.failed.hint")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+
+                    Button {
+                        Task { await storeManager.fetchProducts() }
+                    } label: {
+                        Label("sub.load.failed.retry", systemImage: "arrow.clockwise")
+                            .font(.subheadline.bold())
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 10)
+                            .background(Color.orange)
+                            .foregroundColor(.white)
+                            .cornerRadius(12)
+                    }
+                }
+                .padding(.vertical, 8)
+            } else if products.isEmpty {
                 ProgressView()
             } else {
                 VStack(spacing: 12) {

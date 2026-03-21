@@ -659,7 +659,6 @@ struct RetroCleanView: View {
 
             cardImageRequestIDs[id] = loadCardState(for: asset) { card in
                 DispatchQueue.main.async {
-                    self.cardImageRequestIDs.removeValue(forKey: id)
                     self.loadingIDs.remove(id)
                     guard revision == self.sourceRevision else { return }
                     guard let order = self.assetOrderByID[id] else { return }
@@ -670,8 +669,17 @@ struct RetroCleanView: View {
                     let keepFrom = liveCurrentIndex
                     let keepTo = min(self.assets.count - 1, liveCurrentIndex + self.preloadCount + 2)
                     guard order >= keepFrom && order <= keepTo else { return }
-                    guard self.activeCard?.asset.localIdentifier != id,
-                          !self.buffer.contains(where: { $0.asset.localIdentifier == id }) else { return }
+
+                    // Upgrade path: if card already exists (degraded delivered earlier), update its image
+                    if self.activeCard?.asset.localIdentifier == id {
+                        self.activeCard = card
+                        return
+                    }
+                    if let idx = self.buffer.firstIndex(where: { $0.asset.localIdentifier == id }) {
+                        self.buffer[idx] = card
+                        return
+                    }
+
                     self.insertBufferInOrder(card)
 
                     if self.activeCard == nil {
@@ -759,8 +767,8 @@ struct RetroCleanView: View {
 
         let opt = PHImageRequestOptions()
         opt.isNetworkAccessAllowed = true
-        opt.deliveryMode = .highQualityFormat
-        opt.resizeMode = .exact
+        opt.deliveryMode = .opportunistic
+        opt.resizeMode = .fast
 
         return imageManager.requestImage(
             for: asset,
@@ -769,8 +777,8 @@ struct RetroCleanView: View {
             options: opt
         ) { img, info in
             if let cancelled = info?[PHImageCancelledKey] as? Bool, cancelled { return }
-            if let degraded = info?[PHImageResultIsDegradedKey] as? Bool, degraded { return }
-            completion(CardState(asset: asset, image: img ?? UIImage()))
+            guard let img else { return }
+            completion(CardState(asset: asset, image: img))
         }
     }
 

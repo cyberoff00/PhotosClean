@@ -34,7 +34,14 @@ struct ContentView: View {
         case random
     }
 
+    enum TodayScope: Equatable {
+        case day
+        case week
+        case month
+    }
+
     @State private var dateSourceMode: DateSourceMode = .today
+    @State private var todayScope: TodayScope = .day
     @State private var randomPickedDay: Date? = nil
 
     // MARK: Today/Day source (selected day + unmarked)
@@ -183,6 +190,10 @@ struct ContentView: View {
         !isSourceLoading && activeCard == nil && buffer.isEmpty && loadingIDs.isEmpty
     }
 
+    private var shouldShowRandomContinueState: Bool {
+        shouldShowStageEmptyState && dateSourceMode == .random
+    }
+
     private var shouldShowStageLoadingState: Bool {
         isSourceLoading || (activeCard == nil && buffer.isEmpty && !loadingIDs.isEmpty)
     }
@@ -259,7 +270,7 @@ struct ContentView: View {
                         systemImage: "sparkles",
                         description: Text("empty.description".localized)
                     )
-                    .opacity(shouldShowStageEmptyState ? 1 : 0)
+                    .opacity(shouldShowStageEmptyState && !shouldShowRandomContinueState ? 1 : 0)
 
                     ProgressView()
                         .opacity(shouldShowStageLoadingState ? 1 : 0)
@@ -267,6 +278,10 @@ struct ContentView: View {
                     if activeCard != nil || !buffer.isEmpty {
                         cardStackView
                             .padding(20)
+                    }
+
+                    if shouldShowRandomContinueState {
+                        randomContinueEmptyState
                     }
                 }
                 .frame(height: cardStageHeight)
@@ -572,16 +587,29 @@ struct ContentView: View {
 
             HStack(spacing: 12) {
                 HStack(spacing: 8) {
-                    Button(action: switchToToday) {
-                        Text("filter.today".localized)
-                            .font(.caption.weight(.semibold))
-                            .foregroundColor(dateSourceMode == .today ? .white : .primary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(dateSourceMode == .today ? Color.blue : Color.secondary.opacity(0.12))
-                            .clipShape(Capsule())
+                    Menu {
+                        Button("filter.today".localized) {
+                            activateTodayScope(.day)
+                        }
+                        Button("filter.week".localized) {
+                            activateTodayScope(.week)
+                        }
+                        Button("filter.month".localized) {
+                            activateTodayScope(.month)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(currentTodayScopeLabel.localized)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(dateSourceMode == .today ? .white : .primary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(dateSourceMode == .today ? Color.blue : Color.secondary.opacity(0.12))
+                        .clipShape(Capsule())
                     }
-                    .buttonStyle(.plain)
 
                     Button(action: randomButtonTapped) {
                         HStack(spacing: 6) {
@@ -618,6 +646,17 @@ struct ContentView: View {
             .padding(.top, 2)
         }
         .transaction { $0.animation = nil }
+    }
+
+    private var currentTodayScopeLabel: String {
+        switch todayScope {
+        case .day:
+            return "filter.today"
+        case .week:
+            return "filter.week"
+        case .month:
+            return "filter.month"
+        }
     }
 
     // MARK: - Bottom Buttons
@@ -692,17 +731,36 @@ struct ContentView: View {
         }
     }
 
-    private var selectedSourceDay: Date {
+    private var selectedSourceInterval: DateInterval {
+        let calendar = Calendar.current
         switch dateSourceMode {
         case .today:
-            return Date()
+            return interval(for: todayScope, referenceDate: Date(), calendar: calendar)
         case .random:
-            return randomPickedDay ?? Date()
+            let day = randomPickedDay ?? Date()
+            let start = calendar.startOfDay(for: day)
+            let end = calendar.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(24 * 3600)
+            return DateInterval(start: start, end: end)
+        }
+    }
+
+    private func interval(for scope: TodayScope, referenceDate: Date, calendar: Calendar) -> DateInterval {
+        switch scope {
+        case .day:
+            let start = calendar.startOfDay(for: referenceDate)
+            let end = calendar.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(24 * 3600)
+            return DateInterval(start: start, end: end)
+        case .week:
+            let week = calendar.dateInterval(of: .weekOfYear, for: referenceDate)
+            return week ?? interval(for: .day, referenceDate: referenceDate, calendar: calendar)
+        case .month:
+            let month = calendar.dateInterval(of: .month, for: referenceDate)
+            return month ?? interval(for: .day, referenceDate: referenceDate, calendar: calendar)
         }
     }
 
     private func rebuildCurrentSource(completion: (() -> Void)? = nil) {
-        rebuildSource(for: selectedSourceDay, completion: completion)
+        rebuildSource(for: selectedSourceInterval, completion: completion)
     }
 
     private func refreshCurrentSourcePreservingSelection(showBanner: Bool = false) {
@@ -748,13 +806,12 @@ struct ContentView: View {
         }
     }
 
-    private func rebuildSource(for day: Date, completion: (() -> Void)? = nil) {
+    private func rebuildSource(for interval: DateInterval, completion: (() -> Void)? = nil) {
         sourceLoadToken += 1
         let token = sourceLoadToken
         isSourceLoading = true
-
-        let start = Calendar.current.startOfDay(for: day)
-        let end = Calendar.current.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(24 * 3600)
+        let start = interval.start
+        let end = interval.end
 
         // PHAsset fetch 移到后台线程，避免阻塞主线程
         DispatchQueue.global(qos: .userInitiated).async {
@@ -869,6 +926,24 @@ struct ContentView: View {
         }
     }
 
+    private func activateTodayScope(_ scope: TodayScope) {
+        if dateSourceMode != .today {
+            dateSourceMode = .today
+            randomPickedDay = nil
+        }
+        switchTodayScope(scope)
+    }
+
+    private func switchTodayScope(_ scope: TodayScope) {
+        guard todayScope != scope else { return }
+        todayScope = scope
+        rebuildCurrentSource {
+            recalcTodayPendingCountFast()
+            bootstrapBuffer(force: true)
+            presentTopBannerIfNeeded()
+        }
+    }
+
     private func randomButtonTapped() {
         guard !isPickingRandomDay else { return }
         randomPickToken += 1
@@ -882,7 +957,8 @@ struct ContentView: View {
             guard token == randomPickToken else { return }
             isPickingRandomDay = false
             randomPickedDay = day
-            rebuildSource(for: day) {
+            let interval = interval(for: .day, referenceDate: day, calendar: Calendar.current)
+            rebuildSource(for: interval) {
                 guard token == randomPickToken else { return }
                 recalcTodayPendingCountFast()
                 bootstrapBuffer(force: true)
@@ -904,6 +980,43 @@ struct ContentView: View {
             return "filter.random_date".localized(with: formattedDay(d))
         }
         return "filter.random".localized
+    }
+
+    private var randomContinueEmptyState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "shuffle")
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundColor(.blue)
+
+            Text("random.empty.title".localized)
+                .font(.headline)
+
+            Text("random.empty.description".localized)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+
+            Button(action: randomButtonTapped) {
+                HStack(spacing: 8) {
+                    if isPickingRandomDay {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "sparkles")
+                    }
+                    Text("random.empty.cta".localized)
+                        .font(.headline)
+                }
+                .foregroundColor(.white)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
+                .background(Color.blue)
+                .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(isPickingRandomDay)
+        }
+        .padding(.horizontal, 24)
     }
 
     private func isUnmarkedTodayAsset(_ asset: PHAsset) -> Bool {
@@ -959,12 +1072,18 @@ struct ContentView: View {
 
             cardImageRequestIDs[id] = loadCardState(for: asset) { card in
                 DispatchQueue.main.async {
-                    self.cardImageRequestIDs.removeValue(forKey: id)
                     self.loadingIDs.remove(id)
                     guard revision == self.sourceRevision else { return }
 
-                    guard self.activeCard?.asset.localIdentifier != id,
-                          !self.buffer.contains(where: { $0.asset.localIdentifier == id }) else { return }
+                    // Upgrade path: if card already exists (degraded delivered earlier), update its image
+                    if self.activeCard?.asset.localIdentifier == id {
+                        self.activeCard = card
+                        return
+                    }
+                    if let idx = self.buffer.firstIndex(where: { $0.asset.localIdentifier == id }) {
+                        self.buffer[idx] = card
+                        return
+                    }
 
                     self.insertBufferInTodayOrder(card)
 
@@ -987,8 +1106,8 @@ struct ContentView: View {
 
         let opt = PHImageRequestOptions()
         opt.isNetworkAccessAllowed = true
-        opt.deliveryMode = .highQualityFormat
-        opt.resizeMode = .exact
+        opt.deliveryMode = .opportunistic
+        opt.resizeMode = .fast
 
         return imageManager.requestImage(
             for: asset,
@@ -997,8 +1116,8 @@ struct ContentView: View {
             options: opt
         ) { img, info in
             if let cancelled = info?[PHImageCancelledKey] as? Bool, cancelled { return }
-            if let degraded = info?[PHImageResultIsDegradedKey] as? Bool, degraded { return }
-            completion(CardState(asset: asset, image: img ?? UIImage()))
+            guard let img else { return }
+            completion(CardState(asset: asset, image: img))
         }
     }
 

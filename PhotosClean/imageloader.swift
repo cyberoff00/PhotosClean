@@ -7,6 +7,7 @@ final class PHAssetThumbnailLoader {
 
     // 用 asset.localIdentifier 作为 key
     private let cache = NSCache<NSString, UIImage>()
+    private let manager = PHCachingImageManager()
 
     private init() {
         cache.countLimit = 500
@@ -52,13 +53,13 @@ final class PHAssetThumbnailLoader {
         }
 
         let options = PHImageRequestOptions()
-        options.isNetworkAccessAllowed = true
-        // opportunistic：非常适合缩略图：先给快的（可能 degraded），再给好的
-        options.deliveryMode = .opportunistic
+        // Grid scrolling should never trigger iCloud downloads — local thumbnails are sufficient
+        options.isNetworkAccessAllowed = false
+        options.deliveryMode = .fastFormat
         options.resizeMode = .fast
         options.isSynchronous = false
 
-        return PHImageManager.default().requestImage(
+        return manager.requestImage(
             for: asset,
             targetSize: targetSize,
             contentMode: .aspectFill,
@@ -83,6 +84,23 @@ final class PHAssetThumbnailLoader {
 
     func cancel(_ requestID: PHImageRequestID) {
         guard requestID != PHInvalidImageRequestID else { return }
-        PHImageManager.default().cancelImageRequest(requestID)
+        manager.cancelImageRequest(requestID)
+    }
+
+    /// Pre-warm the system thumbnail cache for assets about to scroll into view.
+    func startPrefetching(_ assets: [PHAsset], targetSize: CGSize) {
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = false
+        options.deliveryMode = .fastFormat
+        options.resizeMode = .fast
+        manager.startCachingImages(for: assets, targetSize: targetSize, contentMode: .aspectFill, options: options)
+    }
+
+    func stopPrefetching(_ assets: [PHAsset], targetSize: CGSize) {
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = false
+        options.deliveryMode = .fastFormat
+        options.resizeMode = .fast
+        manager.stopCachingImages(for: assets, targetSize: targetSize, contentMode: .aspectFill, options: options)
     }
 }

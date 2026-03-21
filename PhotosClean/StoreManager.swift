@@ -32,6 +32,7 @@ final class StoreManager: ObservableObject {
 
     // UI loading state
     @Published var isLoadingPurchase: Bool = false
+    @Published var productLoadFailed: Bool = false
 
     // ✅ Product IDs
     private let productIDs: [String] = [
@@ -67,26 +68,39 @@ final class StoreManager: ObservableObject {
 
     init() {
         Task {
-            await fetchProducts()
-            await updatePurchasedProducts()
+            async let fetch: Void = fetchProducts()
+            async let update: Void = updatePurchasedProducts()
+            _ = await (fetch, update)
             await monitorTransactions()
         }
     }
 
     // MARK: - Fetch products
     func fetchProducts() async {
-        do {
-            let fetched = try await Product.products(for: productIDs)
-            self.products = fetched
-
-            self.subscriptions = fetched
-                .filter { $0.type == .autoRenewable }
-                .sorted { rankSubscription($0) < rankSubscription($1) }
-        } catch {
-            print("Fetch products failed: \(error)")
-            self.products = []
-            self.subscriptions = []
+        productLoadFailed = false
+        let maxRetries = 3
+        for attempt in 1...maxRetries {
+            do {
+                let fetched = try await withTimeout(seconds: 15) {
+                    try await Product.products(for: self.productIDs)
+                }
+                self.products = fetched
+                self.subscriptions = fetched
+                    .filter { $0.type == .autoRenewable }
+                    .sorted { rankSubscription($0) < rankSubscription($1) }
+                self.productLoadFailed = false
+                return // success, exit
+            } catch {
+                print("Fetch products attempt \(attempt)/\(maxRetries) failed: \(error)")
+                if attempt < maxRetries {
+                    try? await Task.sleep(for: .seconds(Double(attempt) * 2))
+                }
+            }
         }
+        // All retries exhausted
+        self.products = []
+        self.subscriptions = []
+        self.productLoadFailed = true
     }
 
     private func rankSubscription(_ p: Product) -> Int {
@@ -206,13 +220,33 @@ final class StoreManager: ObservableObject {
         }
     }
 
-    // MARK: - Timeout Helper
+    // MARK: - Timeout Helpers
     private func withTimeout<T>(
         seconds: TimeInterval = 30,
         operation: @escaping () async -> T
     ) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask { await operation() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw TimeoutError.operationTimeout
+            }
+
+            guard let result = try await group.next() else {
+                throw TimeoutError.operationTimeout
+            }
+
+            group.cancelAll()
+            return result
+        }
+    }
+
+    private func withTimeout<T>(
+        seconds: TimeInterval = 30,
+        operation: @escaping () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
             group.addTask {
                 try await Task.sleep(for: .seconds(seconds))
                 throw TimeoutError.operationTimeout

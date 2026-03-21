@@ -131,6 +131,12 @@
 
 /* --- 通用 & 法律 --- */
 "sub.restore" = "恢复购买";
+
+// 加载失败
+"sub.load.failed.title" = "无法加载订阅方案";
+"sub.load.failed.hint" = "请检查网络连接后重试。如果您正在使用 VPN，请尝试关闭——App Store 区域需要与您的 Apple ID 区域一致。";
+"sub.load.failed.retry" = "重试";
+
 "sub.privacy" = "隐私政策";
 "sub.terms" = "服务条款";
 "sub.premium.active" = "高级版已解锁";
@@ -150,8 +156,14 @@
 
 // 日期来源切换
 "filter.today" = "今天";
+"filter.day" = "日";
+"filter.week" = "周";
+"filter.month" = "月";
 "filter.random" = "随机日期";
 "filter.random_date" = "随机：%@";
+"random.empty.title" = "这一天已经刷完了";
+"random.empty.description" = "继续随机下一天，马上再来一组。";
+"random.empty.cta" = "再来一组";
 
 /* Common */
 "app.name" = "曲奇相片";

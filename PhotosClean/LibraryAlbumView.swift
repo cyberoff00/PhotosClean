@@ -492,6 +492,7 @@ struct LibraryCleanView: View {
         loadCardState(for: asset) { card in
             DispatchQueue.main.async {
                 self.loadingIDs.remove(id)
+                // Always update: first call inserts degraded, second call upgrades to high quality
                 self.cardCache[id] = card
             }
         }
@@ -504,8 +505,8 @@ struct LibraryCleanView: View {
 
         let opt = PHImageRequestOptions()
         opt.isNetworkAccessAllowed = true
-        opt.deliveryMode = .highQualityFormat
-        opt.resizeMode = .exact
+        opt.deliveryMode = .opportunistic
+        opt.resizeMode = .fast
         opt.version = .current
 
         PHImageManager.default().requestImage(
@@ -515,8 +516,8 @@ struct LibraryCleanView: View {
             options: opt
         ) { img, info in
             if let cancelled = info?[PHImageCancelledKey] as? Bool, cancelled { return }
-            if let degraded = info?[PHImageResultIsDegradedKey] as? Bool, degraded { return }
-            completion(CardState(asset: asset, image: img ?? UIImage()))
+            guard let img else { return }
+            completion(CardState(asset: asset, image: img))
         }
     }
 
