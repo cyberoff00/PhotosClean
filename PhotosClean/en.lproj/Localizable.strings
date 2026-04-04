@@ -90,9 +90,10 @@
 "sub.subtitle" = "Unlock all features and enjoy full potential";
 
 // Feature list
-"sub.feature.unlimited" = "Unlimited assess to all features";
-"sub.feature.history" = "Complete history and statistics";
-"sub.feature.privacy" = "100% private, no ads";
+"sub.feature.unlimited" = "Unlimited daily photo sorting";
+"sub.feature.privacy" = "No backups, no extra storage";
+"sub.feature.history" = "Full sorting history & statistics";
+"sub.feature.indie" = "Support an indie developer";
 
 // Monthly plan
 "sub.plan.monthly.title" = "Monthly";
@@ -222,3 +223,11 @@
 "settings.check_update" = "Check for Updates";
 "settings.rate_us" = "Rate Us";
 "settings.legal.section" = "Legal";
+
+/* Daily Quota Upgrade Card */
+"quota.title" = "Daily free limit reached";
+"quota.subtitle" = "You can sort 20 photos for free each day.\nUpgrade for unlimited sorting.";
+"quota.indie" = "Built by a solo developer.\nYour support means the world.";
+
+"quota.cta" = "Learn about Premium";
+"quota.reset.hint" = "Free quota resets tomorrow";

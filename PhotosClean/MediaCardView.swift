@@ -30,6 +30,7 @@ struct MediaCardView: View {
     let onShare: () -> Void
     let onOpenNote: () -> Void
     let hasNote: Bool
+    var onEdgeSwipe: ((CGFloat) -> Void)?
 
     @State private var isVideoLoaded = false
 
@@ -152,7 +153,8 @@ struct MediaCardView: View {
             zoomScale: $zoomScale,
             minScale: 1.0,
             maxScale: 4.0,
-            resetToken: zoomResetToken
+            resetToken: zoomResetToken,
+            onEdgeSwipe: onEdgeSwipe
         )
         .padding(12)
     }

@@ -83,9 +83,10 @@
 "sub.subtitle" = "解锁所有功能，享受完整体验";
 
 // 功能列表
-"sub.feature.unlimited" = "无限制使用所有功能";
-"sub.feature.history" = "完整的历史记录和统计数据";
-"sub.feature.privacy" = "100% 隐私保护，无广告";
+"sub.feature.unlimited" = "每日无限整理，不受额度限制";
+"sub.feature.privacy" = "仅读取相册，不备份不占内存";
+"sub.feature.history" = "完整的整理记录与统计";
+"sub.feature.indie" = "支持独立开发者持续更新";
 
 // 方案选择
 "sub.plan.monthly.title" = "月付";
@@ -205,3 +206,11 @@
 "settings.check_update" = "检查更新";
 "settings.rate_us" = "给我们评分";
 "settings.legal.section" = "法律";
+
+/* Daily Quota Upgrade Card */
+"quota.title" = "今日免费额度已用完";
+"quota.subtitle" = "每天可以免费整理 20 张照片\n升级后不再有数量限制";
+"quota.indie" = "一个人开发的小工具\n你的支持是最大的动力 ☺️";
+
+"quota.cta" = "了解 Premium";
+"quota.reset.hint" = "明天将重置免费额度";

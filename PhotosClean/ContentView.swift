@@ -190,6 +190,11 @@ struct ContentView: View {
         !isSourceLoading && activeCard == nil && buffer.isEmpty && loadingIDs.isEmpty
     }
 
+    /// True when a free user has used up today's quota
+    private var quotaExhaustedForFreeUser: Bool {
+        !storeManager.hasUnlockedPremium && paywallGate.isQuotaExhausted
+    }
+
     private var shouldShowRandomContinueState: Bool {
         shouldShowStageEmptyState && dateSourceMode == .random
     }
@@ -282,6 +287,12 @@ struct ContentView: View {
 
                     if shouldShowRandomContinueState {
                         randomContinueEmptyState
+                    }
+
+                    // Inline quota upgrade card (hard wall for free users)
+                    if quotaExhaustedForFreeUser && !shouldShowStageEmptyState {
+                        quotaUpgradeCard
+                            .transition(.opacity)
                     }
                 }
                 .frame(height: cardStageHeight)
@@ -414,7 +425,8 @@ struct ContentView: View {
                             onToggleLive: toggleLivePhoto,
                             onShare: shareCurrentAsset,
                             onOpenNote: openNoteEditor,
-                            hasNote: hasNoteForCurrentAsset()
+                            hasNote: hasNoteForCurrentAsset(),
+                            onEdgeSwipe: { _ in resetImageZoom() }
                         )
                     } else {
                         SnapshotCardView(image: card.image)
@@ -547,8 +559,8 @@ struct ContentView: View {
                 tag.createdAt = Date()
             }
 
-            // gate
-            self.paywallGate.recordSwipeAndCheckIfNeedPaywall(isPremium: self.storeManager.hasUnlockedPremium)
+            // daily quota gate
+            self.paywallGate.recordSwipe(isPremium: self.storeManager.hasUnlockedPremium)
 
             if self.todayPendingCount > 0 {
                 self.todayPendingCount -= 1
@@ -634,6 +646,25 @@ struct ContentView: View {
                     .disabled(isPickingRandomDay)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+                // Daily quota indicator (free users only)
+                if !storeManager.hasUnlockedPremium {
+                    HStack(spacing: 4) {
+                        Text("\(paywallGate.usedToday)/\(paywallGate.dailyFreeLimit)")
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .foregroundColor(paywallGate.isQuotaExhausted ? .orange : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        paywallGate.isQuotaExhausted
+                            ? Color.orange.opacity(0.12)
+                            : Color.secondary.opacity(0.10)
+                    )
+                    .clipShape(Capsule())
+                }
 
                 Button(action: undoLastAction) {
                     Image(systemName: "arrow.uturn.backward.circle.fill")
@@ -1804,6 +1835,55 @@ struct ContentView: View {
     private func resetImageZoom() {
         zoomScale = 1.0
         zoomResetToken = UUID()
+    }
+
+    // MARK: - Quota upgrade card (inline, not a popup)
+    private var quotaUpgradeCard: some View {
+        VStack(spacing: 18) {
+            Spacer()
+
+            Text("🍪")
+                .font(.system(size: 52))
+
+            VStack(spacing: 6) {
+                Text("quota.title")
+                    .font(.title3.bold())
+                Text("quota.subtitle")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+
+            Text("quota.indie")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.top, 4)
+
+            Button {
+                paywallGate.showPaywall = true
+            } label: {
+                Text("quota.cta")
+                    .font(.subheadline.bold())
+                    .foregroundColor(.white)
+                    .frame(maxWidth: 220)
+                    .padding(.vertical, 12)
+                    .background(Color.orange)
+                    .clipShape(Capsule())
+            }
+
+            Text("quota.reset.hint")
+                .font(.caption2)
+                .foregroundColor(.secondary.opacity(0.7))
+
+            Spacer()
+        }
+        .frame(width: cardWidth, height: cardHeight)
+        .background(
+            RoundedRectangle(cornerRadius: 20)
+                .fill(Color(.systemGray6))
+        )
+        .padding(20)
     }
 }
 

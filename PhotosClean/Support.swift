@@ -58,6 +58,9 @@ struct ZoomableImageView: UIViewRepresentable {
     var minScale: CGFloat = 1.0
     var maxScale: CGFloat = 4.0
     var resetToken: UUID
+    /// Called when user pans past the horizontal edge while zoomed in.
+    /// Positive = swiped right (go previous), negative = swiped left (go next).
+    var onEdgeSwipe: ((CGFloat) -> Void)?
     
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -70,7 +73,7 @@ struct ZoomableImageView: UIViewRepresentable {
         scrollView.maximumZoomScale = maxScale
         scrollView.zoomScale = minScale
         scrollView.bouncesZoom = true
-        scrollView.bounces = false
+        scrollView.bounces = true
         scrollView.showsVerticalScrollIndicator = false
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.decelerationRate = .fast
@@ -116,15 +119,15 @@ struct ZoomableImageView: UIViewRepresentable {
         var parent: ZoomableImageView
         weak var imageView: UIImageView?
         var lastResetToken: UUID?
-        
+
         init(_ parent: ZoomableImageView) {
             self.parent = parent
         }
-        
+
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
             imageView
         }
-        
+
         func scrollViewDidZoom(_ scrollView: UIScrollView) {
             // 只有放大后才允许 scrollView 滚动（图片平移）
             let enable = scrollView.zoomScale > 1.01
@@ -135,7 +138,7 @@ struct ZoomableImageView: UIViewRepresentable {
                 self.parent.zoomScale = scrollView.zoomScale
             }
         }
-        
+
         func scrollViewDidEndZooming(_ scrollView: UIScrollView,
                                      with view: UIView?,
                                      atScale scale: CGFloat) {
@@ -143,6 +146,23 @@ struct ZoomableImageView: UIViewRepresentable {
             scrollView.isScrollEnabled = enable
             DispatchQueue.main.async {
                 self.parent.zoomScale = scale
+            }
+        }
+
+        func scrollViewDidEndDragging(_ scrollView: UIScrollView,
+                                      willDecelerate decelerate: Bool) {
+            guard scrollView.zoomScale > 1.01 else { return }
+
+            let offsetX = scrollView.contentOffset.x
+            let maxOffsetX = scrollView.contentSize.width - scrollView.bounds.width
+            let edgeThreshold: CGFloat = 60
+
+            if offsetX < -edgeThreshold {
+                // 拖过左边缘 → 向右划 → 上一张
+                parent.onEdgeSwipe?(abs(offsetX))
+            } else if maxOffsetX > 0, offsetX > maxOffsetX + edgeThreshold {
+                // 拖过右边缘 → 向左划 → 下一张
+                parent.onEdgeSwipe?(-(offsetX - maxOffsetX))
             }
         }
     }

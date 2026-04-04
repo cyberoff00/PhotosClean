@@ -310,7 +310,8 @@ struct RetroCleanView: View {
                             onToggleLive: toggleLivePhoto,
                             onShare: shareCurrentAsset,
                             onOpenNote: openNoteEditor,
-                            hasNote: hasNoteForCurrentAsset()
+                            hasNote: hasNoteForCurrentAsset(),
+                            onEdgeSwipe: { _ in resetImageZoom() }
                         )
                     } else {
                         RetroSnapshotCardView(image: card.image)
@@ -443,7 +444,7 @@ struct RetroCleanView: View {
                 tag.status = status
                 tag.createdAt = Date()
             }
-            self.paywallGate.recordSwipeAndCheckIfNeedPaywall(isPremium: self.storeManager.hasUnlockedPremium)
+            self.paywallGate.recordSwipe(isPremium: self.storeManager.hasUnlockedPremium)
 
 
             self.stopAllMedia()

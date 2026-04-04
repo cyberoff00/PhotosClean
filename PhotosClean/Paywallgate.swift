@@ -12,37 +12,70 @@ import Combine
 final class PaywallGate: ObservableObject {
     @Published var showPaywall: Bool = false
 
-    // 你想要的免费次数
-    let freeSwipesLimit: Int = 10
+    /// Daily free quota for non-premium users
+    let dailyFreeLimit: Int = 20
 
-    // 用 AppStorage 做持久化（跨页面共享）
-    @AppStorage("free_swipes_used") private var used: Int = 0
+    // Persistent storage
+    @AppStorage("daily_swipes_used") private var used: Int = 0
+    @AppStorage("daily_swipes_date") private var storedDateString: String = ""
+
+    /// How many swipes used today (read-only for UI)
+    var usedToday: Int {
+        resetIfNewDay()
+        return used
+    }
+
+    /// Remaining free swipes today
+    var remaining: Int {
+        max(0, dailyFreeLimit - usedToday)
+    }
+
+    /// Whether the daily quota is exhausted
+    var isQuotaExhausted: Bool {
+        usedToday >= dailyFreeLimit
+    }
 
     func reset() {
         used = 0
+        storedDateString = todayString()
     }
 
-    /// 每次成功“完成一次滑动判定（keep/delete/maybe）”后调用
-    func recordSwipeAndCheckIfNeedPaywall(isPremium: Bool) {
-        guard !isPremium else {
-            showPaywall = false
-            return
+    /// Record a swipe. Returns true if the swipe is allowed, false if quota exhausted.
+    @discardableResult
+    func recordSwipe(isPremium: Bool) -> Bool {
+        guard !isPremium else { return true }
+
+        resetIfNewDay()
+
+        if used >= dailyFreeLimit {
+            return false
         }
 
         used += 1
-        if used >= freeSwipesLimit {
-            showPaywall = true
+        objectWillChange.send()
+        return true
+    }
+
+    /// Check quota without recording (e.g. on page appear)
+    func checkQuota(isPremium: Bool) -> Bool {
+        guard !isPremium else { return true }
+        resetIfNewDay()
+        return used < dailyFreeLimit
+    }
+
+    // MARK: - Private
+
+    private func resetIfNewDay() {
+        let today = todayString()
+        if storedDateString != today {
+            used = 0
+            storedDateString = today
         }
     }
 
-    /// 有些地方你想“进入页面就检查”
-    func checkIfNeedPaywall(isPremium: Bool) {
-        guard !isPremium else {
-            showPaywall = false
-            return
-        }
-        if used >= freeSwipesLimit {
-            showPaywall = true
-        }
+    private func todayString() -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: Date())
     }
 }

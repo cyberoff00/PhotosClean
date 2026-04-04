@@ -222,6 +222,18 @@ struct LibraryCleanView: View {
             }
     }
 
+    private func handleEdgeSwipe(_ translation: CGFloat) {
+        guard !isAnimatingOut else { return }
+        // positive = previous, negative = next
+        if translation > 0, index > 0 {
+            resetImageZoom()
+            commitSwipe(.previous, from: .zero)
+        } else if translation < 0, index < assets.count - 1 {
+            resetImageZoom()
+            commitSwipe(.next, from: .zero)
+        }
+    }
+
     private func bounceBack(from t: CGSize) {
         settleOffset = t
         withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
@@ -304,7 +316,10 @@ struct LibraryCleanView: View {
                             zoomScale: $imageScale,
                             minScale: 1.0,
                             maxScale: 4.0,
-                            resetToken: zoomResetToken
+                            resetToken: zoomResetToken,
+                            onEdgeSwipe: { translation in
+                                handleEdgeSwipe(translation)
+                            }
                         )
                         .frame(width: containerSize.width, height: containerSize.height)
                         .clipped()

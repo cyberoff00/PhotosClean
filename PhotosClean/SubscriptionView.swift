@@ -111,8 +111,8 @@ struct SubscriptionView: View {
             // Features
             VStack(alignment: .leading, spacing: 15) {
                 FeatureRow(icon: "checkmark.circle.fill", textKey: "sub.feature.unlimited")
-                FeatureRow(icon: "checkmark.circle.fill", textKey: "sub.feature.history")
-                FeatureRow(icon: "nosign", textKey: "sub.feature.privacy")
+                FeatureRow(icon: "checkmark.circle.fill", textKey: "sub.feature.privacy")
+                FeatureRow(icon: "checkmark.circle.fill", textKey: "sub.feature.indie")
             }
             .padding(.vertical, 6)
 
@@ -159,9 +159,9 @@ struct SubscriptionView: View {
 
             // Features
             VStack(alignment: .leading, spacing: 15) {
-                FeatureRow(icon: "sparkles", textKey: "sub.feature.unlimited")
-                FeatureRow(icon: "clock.arrow.circlepath", textKey: "sub.feature.history")
-                FeatureRow(icon: "nosign", textKey: "sub.feature.privacy")
+                FeatureRow(icon: "infinity", textKey: "sub.feature.unlimited")
+                FeatureRow(icon: "lock.shield", textKey: "sub.feature.privacy")
+                FeatureRow(icon: "heart.fill", textKey: "sub.feature.indie")
             }
             .padding(.vertical, 6)
 
