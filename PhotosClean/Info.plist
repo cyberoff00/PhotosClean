@@ -5,7 +5,7 @@
 	<key>CFBundleDisplayName</key>
 	<string></string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string></string>
+	<string>需要访问你的相册才能整理和删除照片。</string>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array/>
 	<key>UIBackgroundModes</key>

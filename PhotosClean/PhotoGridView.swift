@@ -8,6 +8,8 @@ import SwiftData
 
 import WidgetKit
 
+import Combine
+
 struct SelectedPhoto: Identifiable, Hashable {
     let id: String // asset.localIdentifier
 }
@@ -25,6 +27,7 @@ struct PhotoGridView: View {
     let filterStatus: String?
 
     @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject var storageStats: StorageStats
     @Query private var allTags: [PhotoTag]
 
     @State private var assets: [PHAsset] = []
@@ -35,8 +38,14 @@ struct PhotoGridView: View {
     @State private var statusByAssetID: [String: String] = [:]
     @State private var isLoading = true
     @State private var searchText = ""
+    // searchText 经过 ~250ms debounce 后写入这里；过滤热路径只跟它走。
+    @State private var debouncedSearchText = ""
     @State private var showingDeleteConfirm = false
+    @State private var showingPhotoAuthAlert = false
     @State private var cachedYearsMonths: [String] = []
+    // 预计算 assetID → (year, month)。loadPhotos 时一次构建，避免在 filter 热路径里
+    // 反复调 Calendar.dateComponents（ICU 很慢）。
+    @State private var yearMonthByID: [String: (Int, Int)] = [:]
 
     // 日期过滤
     @State private var selectedYear: Int?
@@ -117,26 +126,40 @@ struct PhotoGridView: View {
                 Button("grid.cancel".localized, role: .cancel) {}
                 Button("grid.deleteSelected".localized, role: .destructive) { deleteSelectedPhotos() }
             }
+            .alert("grid.photoAuth.title".localized, isPresented: $showingPhotoAuthAlert) {
+                Button("grid.cancel".localized, role: .cancel) {}
+                Button("grid.photoAuth.openSettings".localized) { PhotoLibraryAuth.openSettings() }
+            } message: {
+                Text("grid.photoAuth.message".localized)
+            }
             .sheet(isPresented: $showingBatchNoteSheet) { batchNoteSheet }
             .onAppear {
                 rebuildTagMaps()
                 loadPhotos()
             }
-            .onChange(of: allTags) { _ in
+            .onChange(of: allTags) { _, _ in
                 rebuildTagMaps()
                 // applyStatusFilterFromSnapshot updates `assets` AND calls recomputeFilteredAssets
                 // in one shot, so we do NOT need a separate onChange(of: assets) listener.
                 applyStatusFilterFromSnapshot()
+                storageStats.precacheSizes(for: pendingDeleteAssets)
             }
             // Removed: onChange(of: assets) → was causing a second cascade since
             // applyStatusFilterFromSnapshot already mutates assets AND recomputes.
-            .onChange(of: searchText) { _ in recomputeFilteredAssets() }
-            .onChange(of: selectedYear) { _ in recomputeFilteredAssets() }
-            .onChange(of: selectedMonth) { _ in recomputeFilteredAssets() }
-            .onChange(of: selectedAICategory) { _ in recomputeFilteredAssets() }
-            .onChange(of: aiBlurryIDs) { _ in recomputeFilteredAssets() }
-            .onChange(of: aiDuplicatesIDs) { _ in recomputeFilteredAssets() }
-            .onChange(of: aiScreenshotsIDs) { _ in recomputeFilteredAssets() }
+            // searchText debounce: 250ms 没新输入再触发一次过滤，避免每个 keystroke 全表过滤。
+            .task(id: searchText) {
+                do {
+                    try await Task.sleep(for: .milliseconds(250))
+                    debouncedSearchText = searchText
+                } catch { /* cancelled by next keystroke */ }
+            }
+            .onChange(of: debouncedSearchText) { _, _ in recomputeFilteredAssets() }
+            .onChange(of: selectedYear) { _, _ in recomputeFilteredAssets() }
+            .onChange(of: selectedMonth) { _, _ in recomputeFilteredAssets() }
+            .onChange(of: selectedAICategory) { _, _ in recomputeFilteredAssets() }
+            .onChange(of: aiBlurryIDs) { _, _ in recomputeFilteredAssets() }
+            .onChange(of: aiDuplicatesIDs) { _, _ in recomputeFilteredAssets() }
+            .onChange(of: aiScreenshotsIDs) { _, _ in recomputeFilteredAssets() }
             .navigationDestination(item: $selected) { sel in
                 let list = navigationSnapshot.isEmpty ? filteredAssets : navigationSnapshot
                 let idx = list.firstIndex(where: { $0.localIdentifier == sel.id }) ?? 0
@@ -359,7 +382,8 @@ struct PhotoGridView: View {
             ForEach(cachedYearsMonths, id: \.self) { dateStr in
                 Button(action: {
                     let parts = dateStr.split(separator: "-").map { Int($0) ?? 0 }
-                    selectedYear = parts[0]
+                    guard let first = parts.first else { return }
+                    selectedYear = first
                     selectedMonth = parts.count > 1 ? parts[1] : nil
                 }) {
                     HStack {
@@ -383,18 +407,29 @@ struct PhotoGridView: View {
     }
 
     private var deleteMenuButton: some View {
-        let deleteCount = allTags.filter { $0.status == "delete" }.count
+        let deleteAssets = pendingDeleteAssets
+        let deleteCount = deleteAssets.count
+        let pendingBytes = storageStats.totalBestSize(for: deleteAssets)
+        let approxPrefix = storageStats.allPrecise(for: deleteAssets) ? "" : "~"
+        let sizeLabel = deleteCount > 0 ? " · \(approxPrefix)\(pendingBytes.byteCountShort)" : ""
         return Menu {
             Button(role: .destructive) {
                 showingDeleteConfirm = true
             } label: {
-                Label("grid.deleteAll".localized + " (\(deleteCount))", systemImage: "trash.fill")
+                Label("grid.deleteAll".localized + " (\(deleteCount))" + sizeLabel, systemImage: "trash.fill")
             }
             .disabled(deleteCount == 0)
         } label: {
             Image(systemName: "ellipsis.circle")
         }
         .disabled(deleteCount == 0)
+    }
+
+    /// PHAssets currently marked for deletion (intersection of tags and known assets).
+    private var pendingDeleteAssets: [PHAsset] {
+        let deleteIDs = Set(allTags.filter { $0.status == "delete" }.map { $0.assetID })
+        guard !deleteIDs.isEmpty else { return [] }
+        return allAssetsSnapshot.filter { deleteIDs.contains($0.localIdentifier) }
     }
 
     private var batchNoteSheet: some View {
@@ -648,19 +683,32 @@ struct PhotoGridView: View {
         return CGSize(width: pixelSide, height: pixelSide)
     }
 
-    // 获取所有可用的年月组合（预计算缓存，不在 body 里调用）
-    private func buildAvailableYearsMonths(from source: [PHAsset]) -> [String] {
+    // 通过预计算的 yearMonthByID 派生年月列表，避免重新调 Calendar。
+    private func yearsMonthsForAssets(_ source: [PHAsset]) -> [String] {
         var dateStrings: Set<String> = []
-        let calendar = Calendar.current
-
+        dateStrings.reserveCapacity(source.count / 8)
         for asset in source {
-            let components = calendar.dateComponents([.year, .month], from: asset.creationDate ?? Date())
-            if let year = components.year, let month = components.month {
-                dateStrings.insert("\(year)-\(String(format: "%02d", month))")
+            if let ym = yearMonthByID[asset.localIdentifier] {
+                dateStrings.insert("\(ym.0)-\(String(format: "%02d", ym.1))")
             }
         }
+        return dateStrings.sorted().reversed()
+    }
 
-        return dateStrings.sorted().reversed() // 按日期倒序
+    /// 后台一次性构建 assetID → (year, month) 字典。Calendar 缓存一次复用。
+    private static func computeYearMonthMap(for assets: [PHAsset]) -> [String: (Int, Int)] {
+        var map: [String: (Int, Int)] = [:]
+        map.reserveCapacity(assets.count)
+        let calendar = Calendar.current
+        let comps: Set<Calendar.Component> = [.year, .month]
+        for asset in assets {
+            guard let date = asset.creationDate else { continue }
+            let c = calendar.dateComponents(comps, from: date)
+            if let y = c.year, let m = c.month {
+                map[asset.localIdentifier] = (y, m)
+            }
+        }
+        return map
     }
 
     private func rebuildTagMaps() {
@@ -679,7 +727,7 @@ struct PhotoGridView: View {
 
     private func applyStatusFilterFromSnapshot() {
         assets = applyStatusFilter(to: allAssetsSnapshot, statusByAssetID: statusByAssetID)
-        cachedYearsMonths = buildAvailableYearsMonths(from: assets)
+        cachedYearsMonths = yearsMonthsForAssets(assets)
         recomputeFilteredAssets()
     }
 
@@ -705,15 +753,15 @@ struct PhotoGridView: View {
         var result = assets
 
         if let year = selectedYear, let month = selectedMonth {
-            let calendar = Calendar.current
+            // O(n) 字典查表，避免反复调 Calendar.dateComponents
             result = result.filter { asset in
-                let components = calendar.dateComponents([.year, .month], from: asset.creationDate ?? Date())
-                return components.year == year && components.month == month
+                guard let ym = yearMonthByID[asset.localIdentifier] else { return false }
+                return ym.0 == year && ym.1 == month
             }
         }
 
-        if !searchText.isEmpty {
-            let query = searchText.lowercased()
+        if !debouncedSearchText.isEmpty {
+            let query = debouncedSearchText.lowercased()
             let matchingIDs = Set(noteByAssetID.compactMap { id, note in
                 note.lowercased().contains(query) ? id : nil
             })
@@ -750,11 +798,15 @@ struct PhotoGridView: View {
                 snapshot.append(asset)
             }
 
+            // 同一个后台 pass 里把 (年, 月) 字典也建好，主线程不再做 Calendar 工作。
+            let ymMap = Self.computeYearMonthMap(for: snapshot)
+
             DispatchQueue.main.async {
+                self.yearMonthByID = ymMap
                 self.allAssetsSnapshot = snapshot
                 self.assets = self.applyStatusFilter(to: snapshot, statusByAssetID: self.statusByAssetID)
                 self.isLoading = false
-                self.cachedYearsMonths = self.buildAvailableYearsMonths(from: self.assets)
+                self.cachedYearsMonths = self.yearsMonthsForAssets(self.assets)
                 self.recomputeFilteredAssets()
                 // Pre-warm thumbnail cache for first batch of visible photos
                 self.prefetchInitialThumbnails()
@@ -764,44 +816,61 @@ struct PhotoGridView: View {
 
     func deleteMarkedPhotos() {
         let deleteIDs = allTags.filter { $0.status == "delete" }.map { $0.assetID }
-        let assets = PHAsset.fetchAssets(withLocalIdentifiers: deleteIDs, options: nil)
-
-        PHPhotoLibrary.shared().performChanges({
-            PHAssetChangeRequest.deleteAssets(assets)
-        }) { success, _ in
-            if success {
-                DispatchQueue.main.async {
-                    deleteIDs.forEach { id in
-                        if let tag = allTags.first(where: { $0.assetID == id }) {
-                            modelContext.delete(tag)
-                        }
-                    }
-                    try? modelContext.save()
-                    WidgetCenter.shared.reloadAllTimelines()
-                    loadPhotos()
-                }
+        PhotoLibraryAuth.requestWriteAccess { granted in
+            guard granted else {
+                showingPhotoAuthAlert = true
+                return
             }
+            performDelete(ids: deleteIDs, exitSelection: false)
         }
     }
 
     func deleteSelectedPhotos() {
         let ids = Array(selectedIDs)
-        let assets = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        PhotoLibraryAuth.requestWriteAccess { granted in
+            guard granted else {
+                showingPhotoAuthAlert = true
+                return
+            }
+            performDelete(ids: ids, exitSelection: true)
+        }
+    }
 
-        PHPhotoLibrary.shared().performChanges({
-            PHAssetChangeRequest.deleteAssets(assets)
-        }) { success, _ in
-            if success {
-                DispatchQueue.main.async {
-                    ids.forEach { id in
-                        if let tag = allTags.first(where: { $0.assetID == id }) {
+    private func performDelete(ids: [String], exitSelection: Bool) {
+        // fetchAssets + enumerateObjects 是同步 Photos I/O，整段挪到后台。
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+            var array: [PHAsset] = []
+            array.reserveCapacity(result.count)
+            result.enumerateObjects { a, _, _ in array.append(a) }
+
+            // StorageStats 是 @MainActor，size lookup 在主线程做（dict 查表，毫秒级）。
+            DispatchQueue.main.async {
+                let bytes = storageStats.totalBestSize(for: array)
+                PHPhotoLibrary.shared().performChanges({
+                    PHAssetChangeRequest.deleteAssets(result)
+                }) { success, _ in
+                    DispatchQueue.main.async {
+                        // success=false 一般意味着用户在系统弹窗里取消了删除确认。
+                        guard success else { return }
+                        let idSet = Set(ids)
+
+                        // 1) 立刻把已删除的 asset 从 snapshot 移除，UI 立即反映；
+                        //    避免再调一次 loadPhotos() 全库重抓 + 重建年月字典（几万张时秒级）。
+                        allAssetsSnapshot.removeAll { idSet.contains($0.localIdentifier) }
+
+                        // 2) 标签删除用 Set 一遍过，O(n+m) 替代 O(n×m) 线性扫描。
+                        for tag in allTags where idSet.contains(tag.assetID) {
                             modelContext.delete(tag)
                         }
+                        try? modelContext.save()
+                        // save 触发 @Query 重发 → onChange(of: allTags) 会用最新的
+                        // allAssetsSnapshot + statusByAssetID 重新过滤，结果正确。
+
+                        storageStats.recordCleanup(bytes: bytes)
+                        WidgetCenter.shared.reloadAllTimelines()
+                        if exitSelection { exitSelectionMode() }
                     }
-                    try? modelContext.save()
-                    WidgetCenter.shared.reloadAllTimelines()
-                    exitSelectionMode()
-                    loadPhotos()
                 }
             }
         }
@@ -946,7 +1015,7 @@ struct PhotoGridView: View {
         let manager = PHImageManager.default()
         let options = PHImageRequestOptions()
         options.isSynchronous = false
-        options.deliveryMode = .fastFormat
+        options.deliveryMode = .highQualityFormat
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = false
 
@@ -1074,7 +1143,7 @@ struct AssetThumbnailView: View {
             }
         }
         .onAppear { requestThumbnailIfNeeded() }
-        .onChange(of: asset.localIdentifier) { _ in requestThumbnailIfNeeded() }
+        .onChange(of: asset.localIdentifier) { _, _ in requestThumbnailIfNeeded() }
         .onDisappear {
             // ✅ 关键：滚动复用时取消旧请求，避免错图/浪费
             PHAssetThumbnailLoader.shared.cancel(requestID)

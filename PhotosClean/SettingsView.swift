@@ -3,10 +3,13 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject var storeManager: StoreManager
     @EnvironmentObject var paywallGate: PaywallGate
+    @EnvironmentObject var storageStats: StorageStats
     @Environment(\.openURL) private var openURL
 
+    @State private var showFreedExplanation = false
+
     private let appStoreAppID = "6757628907"
-    private let legalURL = URL(string: "https://seasoned-author-d9f.notion.site/TastyTidy-Privacy-Policy-Terms-of-Service-2db01b2ced5980e485e7ce0495e0b40e?pvs=143")!
+    private let legalURL = URL(string: "https://seasoned-author-d9f.notion.site/TastyTidy-Privacy-Policy-Terms-of-Service-2db01b2ced5980e485e7ce0495e0b40e?pvs=143") ?? URL(string: "https://apple.com")!
 
     var body: some View {
         List {
@@ -23,6 +26,41 @@ struct SettingsView: View {
                             : "sub.premium".localized
                         )
                         .foregroundColor(.secondary)
+                    }
+                }
+            }
+
+            Section("settings.cleanup.section".localized) {
+                Picker(selection: goalBinding) {
+                    ForEach(StorageStats.goalOptions, id: \.self) { bytes in
+                        Text(goalLabel(bytes)).tag(bytes)
+                    }
+                } label: {
+                    Label("settings.cleanup.daily_goal".localized, systemImage: "target")
+                }
+
+                if storageStats.goalEnabled {
+                    HStack {
+                        Label("settings.cleanup.today".localized, systemImage: "chart.bar.fill")
+                        Spacer()
+                        Text("\(storageStats.dailyPendingPeak.byteCountShort) / \(StorageStats.goalLabel(storageStats.dailyGoalBytes))")
+                            .foregroundColor(storageStats.goalAchievedToday ? .green : .secondary)
+                            .font(.caption.monospacedDigit())
+                    }
+                }
+
+                if storageStats.totalBytesCleaned > 0 {
+                    HStack(spacing: 6) {
+                        Label("settings.cleanup.total".localized, systemImage: "tray.full")
+                        Button { showFreedExplanation = true } label: {
+                            Image(systemName: "questionmark.circle")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        Spacer()
+                        Text(storageStats.totalBytesCleaned.byteCountShort)
+                            .foregroundColor(.secondary)
+                            .font(.caption.monospacedDigit())
                     }
                 }
             }
@@ -53,6 +91,22 @@ struct SettingsView: View {
         }
         .navigationTitle("settings.title".localized)
         .navigationBarTitleDisplayMode(.inline)
+        .alert("settings.cleanup.total".localized, isPresented: $showFreedExplanation) {
+            Button("common.ok".localized, role: .cancel) {}
+        } message: {
+            Text("settings.cleanup.total.explain".localized)
+        }
+    }
+
+    private var goalBinding: Binding<Int64> {
+        Binding(
+            get: { storageStats.dailyGoalBytes },
+            set: { storageStats.setDailyGoal($0) }
+        )
+    }
+
+    private func goalLabel(_ bytes: Int64) -> String {
+        bytes == 0 ? "settings.cleanup.goal_off".localized : StorageStats.goalLabel(bytes)
     }
 
     private func openAppStore() {

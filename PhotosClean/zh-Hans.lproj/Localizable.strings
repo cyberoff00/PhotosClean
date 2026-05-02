@@ -44,6 +44,11 @@
 "grid.cancel" = "取消";
 "grid.deleteAll" = "全部删除";
 
+/* Photo permission */
+"grid.photoAuth.title" = "无法删除照片";
+"grid.photoAuth.message" = "请到「设置」开启相册的「完全访问」权限，否则删除操作会被系统静默拦截。";
+"grid.photoAuth.openSettings" = "去设置";
+
 /* RetroCleanView */
 "retro.done" = "完成";
 "retro.finished" = "已经刷完啦";
@@ -58,6 +63,10 @@
 
 // Hints & Onboarding
 "onb.library.unmarked.hint" = "进入待清理照片，快速整理";
+
+/* Library inline hints */
+"library.hint.category" = "你整理过的照片会自动归到下方分类";
+"library.hint.toDelete" = "标为删除的照片在这里，点右上角即可从手机彻底清除";
 "hint.banner.today" = "今天的照片建议及时处理 ✨";
 "hint.banner.today.empty" = "今天没有新照片，随时去图库整理～";
 "hint.gesture.today" = "左右 / 上滑即可分类";
@@ -214,3 +223,17 @@
 
 "quota.cta" = "了解 Premium";
 "quota.reset.hint" = "明天将重置免费额度";
+
+/* 清理目标与庆祝卡 */
+"settings.cleanup.section" = "清理目标";
+"settings.cleanup.daily_goal" = "每日目标";
+"settings.cleanup.goal_off" = "关闭";
+"settings.cleanup.today" = "今日进度";
+"settings.cleanup.total" = "累计已清理";
+"settings.cleanup.total.explain" = "iOS 会把删除的照片保留在「最近删除」相册 30 天。要真正释放存储空间，请打开系统相册，进入「最近删除」并清空。";
+"common.ok" = "好";
+
+"goal.title" = "今日目标达成！";
+"goal.subtitle" = "今天已标记 %@ 待清理";
+"goal.hint" = "去「待删除」相册按下「全部删除」，把空间真正释放出来。";
+"goal.cta" = "知道了";

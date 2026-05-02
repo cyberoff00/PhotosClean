@@ -16,6 +16,9 @@ struct CardState: Identifiable {
 struct LibraryCleanView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var storeManager: StoreManager
+    @EnvironmentObject var paywallGate: PaywallGate
+    @EnvironmentObject var storageStats: StorageStats
     @Query(sort: \PhotoTag.createdAt, order: .reverse) private var allTags: [PhotoTag]
 
     let assets: [PHAsset]
@@ -173,7 +176,7 @@ struct LibraryCleanView: View {
                     .opacity(shouldShow ? 1 : 0)
                     .zIndex(isTop ? 2 : (off == 1 ? 1 : 0))
                     .allowsHitTesting(isTop && !isAnimatingOut && cardCache[id] != nil)
-                    .highPriorityGesture(isTop ? cardGesture() : nil)
+                    .highPriorityGesture(cardGesture(), including: (isTop && !isZooming) ? .all : .subviews)
                 }
             }
         }
@@ -451,6 +454,13 @@ struct LibraryCleanView: View {
     private func cycleClassificationNoNilAfterFirstTap() {
         guard let id = currentAssetID else { return }
 
+        // Daily quota gate
+        let isPremium = storeManager.hasUnlockedPremium
+        if !paywallGate.recordSwipe(isPremium: isPremium) {
+            paywallGate.showPaywall = true
+            return
+        }
+
         let raw = tagCache[id]?.status
         let current: String? = (raw == nil || raw == "pending") ? nil : raw
 
@@ -468,6 +478,10 @@ struct LibraryCleanView: View {
 
         upsertTag(assetID: id) { tag in
             tag.status = next
+        }
+
+        if next == "delete", let asset = currentAsset {
+            storageStats.noteAsset(asset)
         }
 
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -604,8 +618,12 @@ struct LibraryCleanView: View {
         cancelCurrentVideoRequests()
 
         if let cached = videoItemCache[id] {
+            // Create a fresh AVPlayerItem from the cached item's asset.
+            // Reusing a cached AVPlayerItem directly can crash if it's still
+            // associated with a previous AVPlayer instance.
+            let freshItem = AVPlayerItem(asset: cached.asset)
             DispatchQueue.main.async {
-                self.usePlayerItem(cached, preservePlaybackState: false)
+                self.usePlayerItem(freshItem, preservePlaybackState: false)
             }
             return
         }

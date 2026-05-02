@@ -311,7 +311,14 @@ struct RetroCleanView: View {
                             onShare: shareCurrentAsset,
                             onOpenNote: openNoteEditor,
                             hasNote: hasNoteForCurrentAsset(),
-                            onEdgeSwipe: { _ in resetImageZoom() }
+                            onEdgeSwipe: { direction in
+                                resetImageZoom()
+                                if direction > 0 {
+                                    triggerButtonSwipe(status: "keep")
+                                } else {
+                                    triggerButtonSwipe(status: "delete")
+                                }
+                            }
                         )
                     } else {
                         RetroSnapshotCardView(image: card.image)
@@ -326,7 +333,7 @@ struct RetroCleanView: View {
                     .zIndex(Double(stackDisplayCount - idx))
                     .allowsHitTesting(isTop && !isAnimatingOut)
                     .overlay(isTop ? swipeHintOverlay : nil)
-                    .highPriorityGesture(isTop ? cardGesture() : nil)
+                    .highPriorityGesture(cardGesture(), including: (isTop && !isZooming) ? .all : .subviews)
             }
         }
     }
@@ -540,7 +547,7 @@ struct RetroCleanView: View {
         guard !isAnimatingOut else { return }
         guard !isUndoRestoring else { return }
         guard activeCard != nil else { return }
-        guard !isZooming else { return }
+        if isZooming { resetImageZoom() }
 
         let from: CGSize
         switch status {

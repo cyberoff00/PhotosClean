@@ -94,6 +94,9 @@ struct ZoomableImageView: UIViewRepresentable {
     }
     
     func updateUIView(_ scrollView: UIScrollView, context: Context) {
+        // Keep coordinator in sync with latest closures and bindings
+        context.coordinator.parent = self
+
         // 更新图片
         context.coordinator.imageView?.image = image
         
@@ -155,13 +158,11 @@ struct ZoomableImageView: UIViewRepresentable {
 
             let offsetX = scrollView.contentOffset.x
             let maxOffsetX = scrollView.contentSize.width - scrollView.bounds.width
-            let edgeThreshold: CGFloat = 60
+            let edgeThreshold: CGFloat = 15
 
             if offsetX < -edgeThreshold {
-                // 拖过左边缘 → 向右划 → 上一张
                 parent.onEdgeSwipe?(abs(offsetX))
             } else if maxOffsetX > 0, offsetX > maxOffsetX + edgeThreshold {
-                // 拖过右边缘 → 向左划 → 下一张
                 parent.onEdgeSwipe?(-(offsetX - maxOffsetX))
             }
         }
@@ -221,5 +222,36 @@ struct StableVideoPlayerView: UIViewControllerRepresentable {
             uiViewController.player = player
         }
         uiViewController.player?.isMuted = isMuted
+    }
+}
+
+// MARK: - PhotoLibraryAuth
+/// Centralized Photos library authorization for .readWrite (required to delete assets).
+/// iOS defaults to .addOnly when the app never explicitly requests .readWrite — and
+/// PHAssetChangeRequest.deleteAssets silently fails with success=false in that case.
+enum PhotoLibraryAuth {
+    static var canWrite: Bool {
+        PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+    }
+
+    /// Requests .readWrite access. Returns true only when the user grants full access.
+    /// `.limited` returns false because deleteAssets is not honored under limited access.
+    static func requestWriteAccess(_ completion: @escaping (Bool) -> Void) {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        switch status {
+        case .authorized:
+            completion(true)
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { newStatus in
+                DispatchQueue.main.async { completion(newStatus == .authorized) }
+            }
+        default:
+            completion(false)
+        }
+    }
+
+    static func openSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
 }

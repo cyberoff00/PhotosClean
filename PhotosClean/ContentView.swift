@@ -11,6 +11,7 @@ struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject var storeManager: StoreManager
     @EnvironmentObject var paywallGate: PaywallGate
+    @EnvironmentObject var storageStats: StorageStats
 
     @Query(sort: \PhotoTag.createdAt, order: .reverse)
     private var allTags: [PhotoTag]
@@ -293,6 +294,10 @@ struct ContentView: View {
                     if quotaExhaustedForFreeUser && !shouldShowStageEmptyState {
                         quotaUpgradeCard
                             .transition(.opacity)
+                    } else if storageStats.shouldShowCelebrationCard && !shouldShowStageEmptyState {
+                        // Celebration card has lower priority than the quota card
+                        goalAchievedCard
+                            .transition(.opacity)
                     }
                 }
                 .frame(height: cardStageHeight)
@@ -332,6 +337,7 @@ struct ContentView: View {
                 refreshFilmstripSnapshot()
                 presentTopBannerIfNeeded()
             }
+            storageStats.notePendingProgress(pendingReleaseBytes)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ReloadPhotos"))) { _ in
             refreshCurrentSourcePreservingSelection(showBanner: true)
@@ -349,6 +355,9 @@ struct ContentView: View {
             syncNoteForCurrent()
             prepareMediaForCurrent()
             refreshFilmstripSnapshot()
+        }
+        .onChange(of: redCount) { _, _ in
+            storageStats.notePendingProgress(pendingReleaseBytes)
         }
         .onDisappear {
             stopAllMedia()
@@ -426,7 +435,14 @@ struct ContentView: View {
                             onShare: shareCurrentAsset,
                             onOpenNote: openNoteEditor,
                             hasNote: hasNoteForCurrentAsset(),
-                            onEdgeSwipe: { _ in resetImageZoom() }
+                            onEdgeSwipe: { direction in
+                                resetImageZoom()
+                                if direction > 0 {
+                                    triggerButtonSwipe(status: "keep")
+                                } else {
+                                    triggerButtonSwipe(status: "delete")
+                                }
+                            }
                         )
                     } else {
                         SnapshotCardView(image: card.image)
@@ -439,7 +455,7 @@ struct ContentView: View {
                 .zIndex(Double(stackDisplayCount - idx))
                 .allowsHitTesting(isTop && !isAnimatingOut)
                 .overlay(isTop ? swipeHintOverlay : nil)
-                .highPriorityGesture(isTop ? cardGesture() : nil)
+                .highPriorityGesture(cardGesture(), including: (isTop && !isZoomingImage) ? .all : .subviews)
             }
         }
     }
@@ -557,6 +573,10 @@ struct ContentView: View {
             self.upsertTag(assetID: assetID) { tag in
                 tag.status = status
                 tag.createdAt = Date()
+            }
+
+            if status == "delete" {
+                self.storageStats.noteAsset(card.asset)
             }
 
             // daily quota gate
@@ -695,7 +715,7 @@ struct ContentView: View {
         guard !isAnimatingOut else { return }
         guard !isUndoRestoring else { return }
         guard activeCard != nil else { return }
-        guard !isZoomingImage else { return }
+        if isZoomingImage { resetImageZoom() }
 
         // ✅ NEW: using buttons also counts as "user learned gestures"
         hintTodayGestureSeen = true
@@ -714,8 +734,60 @@ struct ContentView: View {
     private var bottomButtons: some View {
         HStack(spacing: 40) {
             ActionButton(icon: "trash.fill", color: .red) { triggerButtonSwipe(status: "delete") }
+                .overlay(alignment: .top) {
+                    stageStatusBadge
+                        .fixedSize()
+                        .alignmentGuide(.top) { d in d[.bottom] + 8 }
+                        .allowsHitTesting(false)
+                }
             ActionButton(icon: "clock.fill", color: .yellow) { triggerButtonSwipe(status: "maybe") }
             ActionButton(icon: "heart.fill", color: .green) { triggerButtonSwipe(status: "keep") }
+        }
+    }
+
+    /// Pending-to-release bytes across all photos currently marked for deletion.
+    private var pendingReleaseBytes: Int64 {
+        let ids = tagCache.compactMap { $0.value.status == "delete" ? $0.key : nil }
+        return storageStats.totalBestSize(forIDs: ids)
+    }
+
+    private var pendingReleaseAllPrecise: Bool {
+        let ids = tagCache.compactMap { $0.value.status == "delete" ? $0.key : nil }
+        return storageStats.allPrecise(forIDs: ids)
+    }
+
+    /// Single status badge: shows pending-to-release size, optionally with goal.
+    @ViewBuilder
+    private var stageStatusBadge: some View {
+        let bytes = pendingReleaseBytes
+        let prefix = pendingReleaseAllPrecise ? "" : "~"
+        let achieved = storageStats.goalAchievedToday
+        let color: Color = achieved ? .green : .red
+
+        if storageStats.goalEnabled {
+            HStack(spacing: 4) {
+                Image(systemName: achieved ? "checkmark.circle.fill" : "target")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("\(prefix)\(bytes.byteCountShort) / \(StorageStats.goalLabel(storageStats.dailyGoalBytes))")
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+            }
+            .foregroundColor(color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(color.opacity(0.12))
+            .clipShape(Capsule())
+        } else if redCount > 0 {
+            HStack(spacing: 4) {
+                Image(systemName: "trash")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("\(prefix)\(bytes.byteCountShort)")
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+            }
+            .foregroundColor(.red)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.red.opacity(0.12))
+            .clipShape(Capsule())
         }
     }
 
@@ -1206,7 +1278,6 @@ struct ContentView: View {
         }
 
         let oldStatus = tag.status
-        let oldCreatedAt = tag.createdAt
 
         update(tag)
         try? modelContext.save()
@@ -1875,6 +1946,51 @@ struct ContentView: View {
             Text("quota.reset.hint")
                 .font(.caption2)
                 .foregroundColor(.secondary.opacity(0.7))
+
+            Spacer()
+        }
+        .frame(width: cardWidth, height: cardHeight)
+        .background(
+            RoundedRectangle(cornerRadius: 20)
+                .fill(Color(.systemGray6))
+        )
+        .padding(20)
+    }
+
+    // MARK: - Goal achieved card (inline, same format as quota card)
+    private var goalAchievedCard: some View {
+        VStack(spacing: 18) {
+            Spacer()
+
+            Text("🎉")
+                .font(.system(size: 52))
+
+            VStack(spacing: 6) {
+                Text("goal.title")
+                    .font(.title3.bold())
+                Text(String(format: "goal.subtitle".localized, storageStats.dailyPendingPeak.byteCountShort))
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+
+            Text("goal.hint")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.top, 4)
+
+            Button {
+                storageStats.dismissCelebrationToday()
+            } label: {
+                Text("goal.cta")
+                    .font(.subheadline.bold())
+                    .foregroundColor(.white)
+                    .frame(maxWidth: 220)
+                    .padding(.vertical, 12)
+                    .background(Color.green)
+                    .clipShape(Capsule())
+            }
 
             Spacer()
         }

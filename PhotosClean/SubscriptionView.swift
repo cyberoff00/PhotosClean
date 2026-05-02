@@ -285,9 +285,11 @@ struct SubscriptionView: View {
             .disabled(restoreDisabled)
 
             HStack(spacing: 15) {
-                Link("sub.privacy", destination: URL(string: "https://seasoned-author-d9f.notion.site/TastyTidy-Privacy-Policy-Terms-of-Service-2db01b2ced5980e485e7ce0495e0b40e?pvs=143")!)
-                Text("•").foregroundColor(.gray.opacity(0.5))
-                Link("sub.terms", destination: URL(string: "https://seasoned-author-d9f.notion.site/TastyTidy-Privacy-Policy-Terms-of-Service-2db01b2ced5980e485e7ce0495e0b40e?pvs=143")!)
+                if let url = URL(string: "https://seasoned-author-d9f.notion.site/TastyTidy-Privacy-Policy-Terms-of-Service-2db01b2ced5980e485e7ce0495e0b40e?pvs=143") {
+                    Link("sub.privacy", destination: url)
+                    Text("•").foregroundColor(.gray.opacity(0.5))
+                    Link("sub.terms", destination: url)
+                }
             }
             .font(.caption2)
             .foregroundColor(.secondary)

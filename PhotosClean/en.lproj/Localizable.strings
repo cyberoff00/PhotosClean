@@ -49,6 +49,11 @@
 "grid.deleteConfirm" = "Confirm permanent deletion?";
 "grid.cancel" = "Cancel";
 "grid.deleteAll" = "Delete All";
+
+/* Photo permission */
+"grid.photoAuth.title" = "Can't delete photos";
+"grid.photoAuth.message" = "Open Settings and grant Full Access to Photos. Without it, iOS silently blocks the delete request.";
+"grid.photoAuth.openSettings" = "Open Settings";
 /* RetroCleanView */
 "retro.done" = "Done";
 "retro.finished" = "You've finished reviewing all photos";
@@ -63,6 +68,10 @@
 
 
 "onb.library.unmarked.hint" = "Review photos that still need cleanup";
+
+/* Library inline hints */
+"library.hint.category" = "Photos you've sorted land in the categories below";
+"library.hint.toDelete" = "Photos marked for deletion live here — tap the top-right to wipe them from your phone";
 
 "hint.banner.today" = "Quickly sort today’s photos ✨";
 "hint.banner.today.empty" = "No new photos today — check Library anytime.";
@@ -231,3 +240,17 @@
 
 "quota.cta" = "Learn about Premium";
 "quota.reset.hint" = "Free quota resets tomorrow";
+
+/* Cleanup goal & celebration */
+"settings.cleanup.section" = "Cleanup Goal";
+"settings.cleanup.daily_goal" = "Daily Goal";
+"settings.cleanup.goal_off" = "Off";
+"settings.cleanup.today" = "Today's progress";
+"settings.cleanup.total" = "All-time freed";
+"settings.cleanup.total.explain" = "iOS keeps deleted photos in Recently Deleted for 30 days. To actually reclaim storage, open the Photos app and empty the Recently Deleted album.";
+"common.ok" = "OK";
+
+"goal.title" = "Daily goal hit!";
+"goal.subtitle" = "You've marked %@ to clean today.";
+"goal.hint" = "Open the To Delete folder and tap Delete All to actually free the space.";
+"goal.cta" = "Got it";

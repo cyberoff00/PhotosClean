@@ -8,3 +8,6 @@
 "widget.display.name" = "照片曲奇盒";
 "widget.description" = "显示今日待处理照片数量";
 "widget.pending.today" = "今日待处理";
+"widget.goal.remaining.subtitle" = "距 %@ 目标";
+"widget.goal.done.title" = "今日达成";
+"widget.goal.done.subtitle" = "目标 %@";

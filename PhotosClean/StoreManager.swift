@@ -205,7 +205,7 @@ final class StoreManager: ObservableObject {
             if let transaction = try? checkVerified(result),
                productIDs.contains(transaction.productID) {
                 await updatePurchasedProducts()
-                _ = try? await transaction.finish()
+                await transaction.finish()
             }
         }
     }

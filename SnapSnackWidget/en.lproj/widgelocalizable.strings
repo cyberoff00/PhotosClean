@@ -8,3 +8,6 @@
 "widget.display.name" = "Tastytidy";
 "widget.description" = "Show the number of unsorted photos today";
 "widget.pending.today" = "Unsorted Photos Today";
+"widget.goal.remaining.subtitle" = "to %@ goal";
+"widget.goal.done.title" = "Goal hit";
+"widget.goal.done.subtitle" = "%@ goal";

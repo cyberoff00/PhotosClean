@@ -9,6 +9,9 @@ struct LibraryView: View {
     @Query private var allTags: [PhotoTag]
     @State private var folderCounts: [String: Int] = [:]
 
+    @AppStorage("hint_library_category_dismissed") private var categoryHintDismissed = false
+    @AppStorage("hint_library_todelete_dismissed") private var toDeleteHintDismissed = false
+
 //    // ✅ 你现在的 Notion 页面同时包含 Privacy + Terms，就先复用同一个 URL
 //    //    如果你之后拆成两个页面，把 termsURL 换成新的即可
 //    private let privacyURL = URL(
@@ -53,7 +56,7 @@ struct LibraryView: View {
                     )
                 }
 
-                Section("library.category".localized) {
+                Section {
                     NavigationLink(
                         destination: PhotoGridView(
                             title: "library.favorites".localized,
@@ -94,6 +97,56 @@ struct LibraryView: View {
                             color: .red,
                             count: folderCounts["delete"] ?? 0
                         )
+                    }
+
+                    if !toDeleteHintDismissed {
+                        HStack(alignment: .top, spacing: 6) {
+                            Text("library.hint.toDelete".localized)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            Spacer(minLength: 4)
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    toDeleteHintDismissed = true
+                                }
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundColor(.secondary)
+                                    .padding(4)
+                                    .background(Color(.tertiarySystemBackground))
+                                    .clipShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 20, bottom: 4, trailing: 16))
+                    }
+                } header: {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("library.category".localized)
+                        if !categoryHintDismissed {
+                            Text("library.hint.category".localized)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .textCase(nil)
+                            Spacer(minLength: 4)
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    categoryHintDismissed = true
+                                }
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundColor(.secondary)
+                                    .padding(4)
+                                    .background(Color(.tertiarySystemBackground))
+                                    .clipShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .textCase(nil)
+                        }
                     }
                 }
             }
