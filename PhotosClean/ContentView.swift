@@ -5,6 +5,7 @@ import WidgetKit
 import AVKit
 import PhotosUI
 import UIKit
+import Combine
 
 // MARK: - ContentView
 struct ContentView: View {
@@ -56,6 +57,12 @@ struct ContentView: View {
 
     // MARK: Header counts cache（避免 body 里每帧 filter allTags）
     @State private var redCount: Int = 0
+
+    // MARK: Pending-release cache
+    // Recomputed only when redCount or storageStats precise sizes change.
+    // Body must NOT iterate tagCache on every drag frame.
+    @State private var pendingReleaseBytesCache: Int64 = 0
+    @State private var pendingReleaseAllPreciseCache: Bool = true
 
     // MARK: Widget count cache
     @State private var todayPendingCount: Int = 0
@@ -331,6 +338,7 @@ struct ContentView: View {
         }
         .onAppear {
             buildTagCacheOnce()
+            recomputePendingRelease()
             rebuildCurrentSource {
                 recalcTodayPendingCountFast()
                 bootstrapBuffer(force: true)
@@ -357,7 +365,13 @@ struct ContentView: View {
             refreshFilmstripSnapshot()
         }
         .onChange(of: redCount) { _, _ in
+            recomputePendingRelease()
             storageStats.notePendingProgress(pendingReleaseBytes)
+        }
+        // When async precise-size results land, refresh the cache so the
+        // "~" approx prefix can drop off without rerunning per body frame.
+        .onReceive(storageStats.$preciseSizes.dropFirst()) { _ in
+            recomputePendingRelease()
         }
         .onDisappear {
             stopAllMedia()
@@ -455,7 +469,14 @@ struct ContentView: View {
                 .zIndex(Double(stackDisplayCount - idx))
                 .allowsHitTesting(isTop && !isAnimatingOut)
                 .overlay(isTop ? swipeHintOverlay : nil)
-                .highPriorityGesture(cardGesture(), including: (isTop && !isZoomingImage) ? .all : .subviews)
+                // Only attach the drag recognizer to the top card. The previous
+                // "always attach + mask" form created gesture state for every
+                // card in the stack and re-installed the recognizer when the
+                // top changed, which showed up as a flash after each swipe.
+                .highPriorityGesture(
+                    isTop ? cardGesture() : nil,
+                    including: (isTop && !isZoomingImage) ? .all : .subviews
+                )
             }
         }
     }
@@ -745,15 +766,27 @@ struct ContentView: View {
         }
     }
 
-    /// Pending-to-release bytes across all photos currently marked for deletion.
-    private var pendingReleaseBytes: Int64 {
-        let ids = tagCache.compactMap { $0.value.status == "delete" ? $0.key : nil }
-        return storageStats.totalBestSize(forIDs: ids)
-    }
+    /// Cached pending-release total. Hot path getter for the badge — no allocation,
+    /// no tagCache iteration. Refresh via `recomputePendingRelease()`.
+    private var pendingReleaseBytes: Int64 { pendingReleaseBytesCache }
 
-    private var pendingReleaseAllPrecise: Bool {
-        let ids = tagCache.compactMap { $0.value.status == "delete" ? $0.key : nil }
-        return storageStats.allPrecise(forIDs: ids)
+    private var pendingReleaseAllPrecise: Bool { pendingReleaseAllPreciseCache }
+
+    /// Walk tagCache once and update cached totals. Called when redCount changes
+    /// or when async precise-size results arrive — never per body re-eval.
+    private func recomputePendingRelease() {
+        var total: Int64 = 0
+        var allPrecise = true
+        for (id, tag) in tagCache where tag.status == "delete" {
+            total += storageStats.bestSize(forID: id)
+            if !storageStats.hasPrecise(forID: id) { allPrecise = false }
+        }
+        if pendingReleaseBytesCache != total {
+            pendingReleaseBytesCache = total
+        }
+        if pendingReleaseAllPreciseCache != allPrecise {
+            pendingReleaseAllPreciseCache = allPrecise
+        }
     }
 
     /// Single status badge: shows pending-to-release size, optionally with goal.

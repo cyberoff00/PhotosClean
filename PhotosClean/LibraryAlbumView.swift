@@ -176,7 +176,10 @@ struct LibraryCleanView: View {
                     .opacity(shouldShow ? 1 : 0)
                     .zIndex(isTop ? 2 : (off == 1 ? 1 : 0))
                     .allowsHitTesting(isTop && !isAnimatingOut && cardCache[id] != nil)
-                    .highPriorityGesture(cardGesture(), including: (isTop && !isZooming) ? .all : .subviews)
+                    .highPriorityGesture(
+                        isTop ? cardGesture() : nil,
+                        including: (isTop && !isZooming) ? .all : .subviews
+                    )
                 }
             }
         }

@@ -65,6 +65,8 @@ final class StorageStats: ObservableObject {
     private var inflightIDs: Set<String> = []
     private var lastKnownPendingBytes: Int64 = 0
     private var widgetReloadTask: Task<Void, Never>?
+    private var pendingProgressDebounceTask: Task<Void, Never>?
+    private var pendingProgressLatestBytes: Int64 = 0
 
     private static let appGroupID = "group.com.claire.TastyTidy"
 
@@ -132,7 +134,18 @@ final class StorageStats: ObservableObject {
 
     /// Update sticky daily peak from the current pending-to-release total
     /// and re-derive goal-hit state from that peak.
+    /// Debounced so rapid swipes don't trigger a UserDefaults+widget churn loop.
     func notePendingProgress(_ pendingBytes: Int64) {
+        pendingProgressLatestBytes = pendingBytes
+        pendingProgressDebounceTask?.cancel()
+        pendingProgressDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.applyPendingProgress(self.pendingProgressLatestBytes)
+        }
+    }
+
+    private func applyPendingProgress(_ pendingBytes: Int64) {
         lastKnownPendingBytes = pendingBytes
         let today = Self.todayString()
         var changed = false
@@ -322,10 +335,29 @@ final class StorageStats: ObservableObject {
         }
     }
 
-    private static func todayString() -> String {
+    /// Static formatter — creating a `DateFormatter` per call is a known perf trap
+    /// because ICU initialization is expensive. Reuse a single instance.
+    private static let dayFormatter: DateFormatter = {
         let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.dateFormat = "yyyy-MM-dd"
-        return fmt.string(from: Date())
+        return fmt
+    }()
+
+    /// Cache today's "yyyy-MM-dd" so hot-path getters
+    /// (called per-frame from SwiftUI body) skip formatting entirely.
+    private static var cachedTodayString: String = ""
+    private static var cachedTodayDay: Int = -1
+
+    private static func todayString() -> String {
+        let day = Calendar.current.ordinality(of: .day, in: .era, for: Date()) ?? 0
+        if day == cachedTodayDay, !cachedTodayString.isEmpty {
+            return cachedTodayString
+        }
+        let s = dayFormatter.string(from: Date())
+        cachedTodayDay = day
+        cachedTodayString = s
+        return s
     }
 
     // MARK: - Disk cache
@@ -352,10 +384,16 @@ final class StorageStats: ObservableObject {
 
 extension Int64 {
     /// Compact byte string e.g. "342 MB", "1.2 GB".
+    /// Reuses a single `ByteCountFormatter` — instantiating one per call
+    /// burns measurable time on the swipe hot path.
     var byteCountShort: String {
+        Self.sharedByteCountFormatter.string(fromByteCount: self)
+    }
+
+    private static let sharedByteCountFormatter: ByteCountFormatter = {
         let bcf = ByteCountFormatter()
         bcf.allowedUnits = [.useKB, .useMB, .useGB]
         bcf.countStyle = .file
-        return bcf.string(fromByteCount: self)
-    }
+        return bcf
+    }()
 }
