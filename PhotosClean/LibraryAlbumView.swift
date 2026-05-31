@@ -34,6 +34,9 @@ struct LibraryCleanView: View {
 
     @State private var livePhoto: PHLivePhoto?
     @State private var isPlayingLivePhoto = false
+    /// Identifies the in-flight Live Photo request so a stale callback
+    /// (user swiped away or tapped stop) can be ignored.
+    @State private var livePhotoRequestID: UUID?
     @State private var player: AVPlayer?
     @State private var isMuted = true
     @State private var currentVideoAssetID: String? = nil
@@ -571,6 +574,7 @@ struct LibraryCleanView: View {
 
         isPlayingLivePhoto = false
         livePhoto = nil
+        livePhotoRequestID = nil
 
         isMuted = true
 
@@ -586,6 +590,7 @@ struct LibraryCleanView: View {
 
         if isPlayingLivePhoto {
             isPlayingLivePhoto = false
+            livePhotoRequestID = nil
             return
         }
 
@@ -595,7 +600,13 @@ struct LibraryCleanView: View {
 
         let opt = PHLivePhotoRequestOptions()
         opt.isNetworkAccessAllowed = true
-        opt.deliveryMode = .highQualityFormat
+        // Live Photos must play the FULL result: the degraded delivery is a
+        // still-only placeholder with no motion.
+        opt.deliveryMode = .opportunistic
+
+        let requestID = UUID()
+        livePhotoRequestID = requestID
+        let assetID = asset.localIdentifier
 
         PHImageManager.default().requestLivePhoto(
             for: asset,
@@ -603,11 +614,16 @@ struct LibraryCleanView: View {
             contentMode: .aspectFit,
             options: opt
         ) { live, info in
-            if let degraded = info?[PHImageResultIsDegradedKey] as? Bool, degraded { return }
-
+            guard let live else { return }
+            let degraded = (info?[PHLivePhotoInfoIsDegradedKey] as? Bool) ?? false
+            guard !degraded else { return }
             DispatchQueue.main.async {
+                // Ignore stale callbacks: the user may have swiped to another
+                // card or tapped stop while this request was in flight.
+                guard self.livePhotoRequestID == requestID,
+                      self.currentAsset?.localIdentifier == assetID else { return }
                 self.livePhoto = live
-                self.isPlayingLivePhoto = (live != nil)
+                self.isPlayingLivePhoto = true
             }
         }
     }

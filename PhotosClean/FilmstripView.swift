@@ -15,7 +15,8 @@ struct FilmstripView: View {
     // Show a compact window of thumbnails (default 5) so the strip doesn't
     // dominate the layout. Users can still scroll horizontally.
     var visibleCount: Int = 5
-    private var assetIDs: [String] { assets.map(\.localIdentifier) }
+
+    @State private var centerWork: DispatchWorkItem?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -54,23 +55,29 @@ struct FilmstripView: View {
                 .frame(maxWidth: .infinity, alignment: .center)
                 .scrollBounceBehavior(.basedOnSize)
                 .onAppear {
-                    centerSelected(in: proxy)
+                    scheduleCenter(in: proxy)
                 }
+                // Re-center on selection change or when the strip's contents change.
+                // Using assets.count (O(1)) instead of mapping every id each render,
+                // and coalescing both triggers into a single scrollTo per runloop.
                 .onChange(of: selectedID) { _, _ in
-                    centerSelected(in: proxy)
+                    scheduleCenter(in: proxy)
                 }
-                .onChange(of: assetIDs) { _, _ in
-                    centerSelected(in: proxy)
+                .onChange(of: assets.count) { _, _ in
+                    scheduleCenter(in: proxy)
                 }
             }
         }
     }
 
-    private func centerSelected(in proxy: ScrollViewProxy) {
+    private func scheduleCenter(in proxy: ScrollViewProxy) {
+        centerWork?.cancel()
         guard let id = selectedID else { return }
-        DispatchQueue.main.async {
+        let work = DispatchWorkItem {
             proxy.scrollTo(id, anchor: .center)
         }
+        centerWork = work
+        DispatchQueue.main.async(execute: work)
     }
 }
 

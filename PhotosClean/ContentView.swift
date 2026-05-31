@@ -13,6 +13,7 @@ struct ContentView: View {
     @EnvironmentObject var storeManager: StoreManager
     @EnvironmentObject var paywallGate: PaywallGate
     @EnvironmentObject var storageStats: StorageStats
+    @EnvironmentObject var ratingPrompt: RatingPrompt
 
     @Query(sort: \PhotoTag.createdAt, order: .reverse)
     private var allTags: [PhotoTag]
@@ -46,6 +47,20 @@ struct ContentView: View {
     @State private var todayScope: TodayScope = .day
     @State private var randomPickedDay: Date? = nil
 
+    // MARK: Random-day pre-warming
+    // Pick the *next* random day ahead of time and pre-download its first photos
+    // so tapping "Random" lands on already-sharp images instead of waiting on iCloud.
+    @State private var prewarmedRandomDay: Date? = nil
+    @State private var prewarmedRandomAssets: [PHAsset] = []
+    /// Assets currently registered with PHCachingImageManager for prefetch, so we
+    /// can stop the previous set and avoid unbounded caching growth.
+    @State private var cachedPrewarmAssets: [PHAsset] = []
+    @State private var isPrewarmingRandom = false
+    /// When false, pre-warming only runs on Wi-Fi. Default true (data is cheap;
+    /// the user can restrict it in Settings). Mirrored by SettingsView.
+    @AppStorage("prewarm_use_cellular") private var prewarmUseCellular: Bool = true
+    private static let randomPrewarmCount = 8
+
     // MARK: Today/Day source (selected day + unmarked)
     @State private var todayAssets: [PHAsset] = []
     @State private var todayCursor: Int = 0
@@ -57,12 +72,17 @@ struct ContentView: View {
 
     // MARK: Header counts cache（避免 body 里每帧 filter allTags）
     @State private var redCount: Int = 0
+    @State private var showCleanupAuthAlert = false
 
     // MARK: Pending-release cache
     // Recomputed only when redCount or storageStats precise sizes change.
     // Body must NOT iterate tagCache on every drag frame.
     @State private var pendingReleaseBytesCache: Int64 = 0
     @State private var pendingReleaseAllPreciseCache: Bool = true
+
+    // Library oldest/newest creation dates. Cached so repeated "random day"
+    // picks don't re-run two PHAsset.fetchAssets queries each time.
+    @State private var cachedLibraryDateBounds: (oldest: Date, newest: Date)? = nil
 
     // MARK: Widget count cache
     @State private var todayPendingCount: Int = 0
@@ -81,6 +101,20 @@ struct ContentView: View {
     // MARK: Media
     @State private var livePhoto: PHLivePhoto?
     @State private var isPlayingLivePhoto = false
+    /// The asset `livePhoto` belongs to, so we only play it for the matching card.
+    @State private var livePhotoAssetID: String?
+    /// In-flight background Live Photo preload, cancelled on card change.
+    @State private var livePhotoPreloadID: PHImageRequestID = PHInvalidImageRequestID
+    /// True while waiting on an iCloud Live Photo download triggered by a tap.
+    @State private var isLoadingLivePhoto = false
+    /// User tapped before the Live Photo finished loading — auto-play when it lands.
+    @State private var pendingLivePlay = false
+    /// Look-ahead cache: fully-loaded Live Photos for upcoming cards, so reaching
+    /// a Live Photo and tapping plays instantly (no spinner).
+    @State private var livePhotoCache: [String: PHLivePhoto] = [:]
+    @State private var liveWarmInFlight: Set<String> = []
+    private static let liveWarmAhead = 2     // upcoming Live Photos to pre-download
+    private static let liveCacheCap = 5
     @State private var player: AVPlayer?
     @State private var isMuted = true
     @State private var currentVideoAssetID: String? = nil
@@ -167,12 +201,15 @@ struct ContentView: View {
         loadingIDs.insert(id)
         cardImageRequestIDs[id] = loadCardState(for: asset) { card in
             DispatchQueue.main.async {
-                self.cardImageRequestIDs.removeValue(forKey: id)
-                self.loadingIDs.remove(id)
                 guard revision == self.sourceRevision else { return }
+                let isFirstDelivery = (self.loadingIDs.remove(id) != nil)
+                // A late full-res delivery must not overwrite a card the user has
+                // already swiped to during the degraded→full window.
+                if let current = self.activeCard, current.asset.localIdentifier != id { return }
                 self.activeCard = card
+                guard isFirstDelivery else { return }   // run one-time setup once
+                // Media prep (video/Live Photo) is driven by onChange(of: activeCard.id).
                 self.syncNoteForCurrent()
-                self.prepareMediaForCurrent()
                 self.ensureBuffer()
                 self.refreshFilmstripSnapshot()
             }
@@ -346,6 +383,9 @@ struct ContentView: View {
                 presentTopBannerIfNeeded()
             }
             storageStats.notePendingProgress(pendingReleaseBytes)
+            // Warm the first random day in the background so the initial "Random"
+            // tap is already fast and sharp.
+            prewarmNextRandomDay()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ReloadPhotos"))) { _ in
             refreshCurrentSourcePreservingSelection(showBanner: true)
@@ -370,12 +410,21 @@ struct ContentView: View {
         }
         // When async precise-size results land, refresh the cache so the
         // "~" approx prefix can drop off without rerunning per body frame.
-        .onReceive(storageStats.$preciseSizes.dropFirst()) { _ in
+        // Throttled: size prefetch can publish many batches in a burst, and
+        // recomputePendingRelease() is O(tagCache) — without throttling this
+        // recomputes app-wide on every batch and makes all taps feel laggy.
+        .onReceive(storageStats.$preciseSizes.dropFirst().throttle(for: .milliseconds(300), scheduler: RunLoop.main, latest: true)) { _ in
             recomputePendingRelease()
         }
         .onDisappear {
             stopAllMedia()
             cancelPendingImageRequests()
+        }
+        .alert("cleanup.auth.title".localized, isPresented: $showCleanupAuthAlert) {
+            Button("cleanup.auth.settings".localized) { PhotoLibraryAuth.openSettings() }
+            Button("common.cancel".localized, role: .cancel) {}
+        } message: {
+            Text("cleanup.auth.message".localized)
         }
 
     }
@@ -437,6 +486,7 @@ struct ContentView: View {
                             displayImage: card.image,
                             livePhoto: $livePhoto,
                             isPlayingLivePhoto: $isPlayingLivePhoto,
+                            isLoadingLivePhoto: isLoadingLivePhoto,
                             zoomScale: $zoomScale,
                             zoomResetToken: zoomResetToken,
                             player: $player,
@@ -591,6 +641,12 @@ struct ContentView: View {
             self.undoStack.append(assetID)
             self.sessionProcessed.insert(assetID)
 
+            // Cancel any in-flight (esp. iCloud) image download for the swiped
+            // card so it stops competing with the next card's high-res fetch.
+            if let reqID = self.cardImageRequestIDs.removeValue(forKey: assetID) {
+                self.imageManager.cancelImageRequest(reqID)
+            }
+
             self.upsertTag(assetID: assetID) { tag in
                 tag.status = status
                 tag.createdAt = Date()
@@ -602,6 +658,14 @@ struct ContentView: View {
 
             // daily quota gate
             self.paywallGate.recordSwipe(isPremium: self.storeManager.hasUnlockedPremium)
+
+            // Hard wall: the moment a free user uses up today's quota, auto-present
+            // the paywall sheet (the inline upgrade card stays as a fallback).
+            if !self.storeManager.hasUnlockedPremium,
+               self.paywallGate.isQuotaExhausted,
+               !self.paywallGate.showPaywall {
+                self.paywallGate.showPaywall = true
+            }
 
             if self.todayPendingCount > 0 {
                 self.todayPendingCount -= 1
@@ -634,9 +698,20 @@ struct ContentView: View {
 
         // Keep a normal product header (brand/title), and place Today/Random a bit lower.
         return VStack(alignment: .leading, spacing: 8) {
-            Text("header.title".localized)
-                .font(.system(size: 30, weight: .bold))
-                .foregroundStyle(.primary)
+            HStack(alignment: .center) {
+                Text("header.title".localized)
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundStyle(.primary)
+
+                Spacer()
+
+                // One-tap cleanup: actually delete everything marked for deletion,
+                // so users don't need to dig into the "To Delete" folder. Appears
+                // only once something has been left-swiped.
+                if redCount > 0 {
+                    cleanupTrashButton
+                }
+            }
 
             HStack(spacing: 12) {
                 HStack(spacing: 8) {
@@ -754,7 +829,9 @@ struct ContentView: View {
 
     private var bottomButtons: some View {
         HStack(spacing: 40) {
-            ActionButton(icon: "trash.fill", color: .red) { triggerButtonSwipe(status: "delete") }
+            // Gray, not red: left-swipe / this button only *marks* for deletion.
+            // The actual delete is the red trash in the header.
+            ActionButton(icon: "trash.fill", color: .gray) { triggerButtonSwipe(status: "delete") }
                 .overlay(alignment: .top) {
                     stageStatusBadge
                         .fixedSize()
@@ -824,6 +901,86 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - One-tap cleanup (delete everything marked for deletion)
+
+    private var cleanupTrashButton: some View {
+        Button(action: cleanupMarkedForDeletion) {
+            HStack(spacing: 5) {
+                Image(systemName: "trash.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("\(redCount)")
+                    .font(.subheadline.weight(.bold).monospacedDigit())
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(Color.red)
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(isAnimatingOut || isUndoRestoring)
+    }
+
+    /// Collect every asset whose freshest tag is "delete" and remove it from the
+    /// photo library. iOS shows its own deletion confirmation before anything is
+    /// actually deleted, so this is safe as a single tap.
+    private func cleanupMarkedForDeletion() {
+        var latest: [String: (status: String, date: Date)] = [:]
+        for tag in allTags {
+            if let e = latest[tag.assetID], tag.createdAt <= e.date { continue }
+            latest[tag.assetID] = (tag.status, tag.createdAt)
+        }
+        let ids = latest.compactMap { $0.value.status == "delete" ? $0.key : nil }
+        guard !ids.isEmpty else { return }
+
+        PhotoLibraryAuth.requestWriteAccess { granted in
+            guard granted else {
+                showCleanupAuthAlert = true
+                return
+            }
+            performCleanupDelete(ids: ids)
+        }
+    }
+
+    private func performCleanupDelete(ids: [String]) {
+        // fetchAssets + enumerate is synchronous Photos I/O — keep it off main.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+            var array: [PHAsset] = []
+            array.reserveCapacity(result.count)
+            result.enumerateObjects { a, _, _ in array.append(a) }
+
+            DispatchQueue.main.async {
+                let bytes = storageStats.totalBestSize(for: array)
+                PHPhotoLibrary.shared().performChanges({
+                    PHAssetChangeRequest.deleteAssets(result)
+                }) { success, _ in
+                    DispatchQueue.main.async {
+                        // success=false means the user cancelled the system delete dialog.
+                        guard success else { return }
+                        let idSet = Set(ids)
+
+                        for tag in allTags where idSet.contains(tag.assetID) {
+                            modelContext.delete(tag)
+                        }
+                        try? modelContext.save()
+
+                        for id in idSet { tagCache.removeValue(forKey: id) }
+                        redCount = 0   // every delete-marked asset was just removed
+
+                        storageStats.recordCleanup(bytes: bytes)
+                        ratingPrompt.registerCleanup()
+                        recomputePendingRelease()
+                        storageStats.notePendingProgress(pendingReleaseBytes)
+                        WidgetCenter.shared.reloadAllTimelines()
+                        // The library change observer fires ReloadPhotos, which
+                        // refreshes the current source so deleted assets drop out.
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Bootstrap / Today source
     private func bootstrapBuffer(force: Bool) {
         if force {
@@ -832,6 +989,8 @@ struct ContentView: View {
             stopAllMedia()
             buffer.removeAll()
             loadingIDs.removeAll()
+            livePhotoCache.removeAll()
+            liveWarmInFlight.removeAll()
             activeCard = nil
             settleOffset = .zero
             todayCursor = 0
@@ -855,12 +1014,15 @@ struct ContentView: View {
 
         cardImageRequestIDs[id] = loadCardState(for: firstAsset) { card in
             DispatchQueue.main.async {
-                self.cardImageRequestIDs.removeValue(forKey: id)
-                self.loadingIDs.remove(id)
                 guard revision == self.sourceRevision else { return }
+                let isFirstDelivery = (self.loadingIDs.remove(id) != nil)
+                // A late full-res delivery must not overwrite a card the user has
+                // already swiped to during the degraded→full window.
+                if let current = self.activeCard, current.asset.localIdentifier != id { return }
                 self.activeCard = card
+                guard isFirstDelivery else { return }   // run one-time setup once
+                // Media prep (video/Live Photo) is driven by onChange(of: activeCard.id).
                 self.syncNoteForCurrent()
-                self.prepareMediaForCurrent()
                 self.refreshFilmstripSnapshot()
                 self.ensureBuffer()
             }
@@ -1000,14 +1162,20 @@ struct ContentView: View {
             tag.status == "pending" ? nil : tag.assetID
         })
         let sessionProcessedIDs = sessionProcessed
+        // Snapshot the cached bounds on the main thread before going background.
+        let cachedBounds = cachedLibraryDateBounds
 
         // 整个随机选日逻辑移到后台线程，避免阻塞 UI
         DispatchQueue.global(qos: .userInitiated).async {
-            guard let bounds = self.fetchLibraryDateBounds() else {
+            guard let bounds = cachedBounds ?? self.fetchLibraryDateBounds() else {
                 DispatchQueue.main.async {
                     completion(self.randomPickedDay ?? Calendar.current.startOfDay(for: Date()))
                 }
                 return
+            }
+            // Persist freshly-computed bounds back to the cache (on main).
+            if cachedBounds == nil {
+                DispatchQueue.main.async { self.cachedLibraryDateBounds = bounds }
             }
 
             let calendar = Calendar.current
@@ -1084,11 +1252,34 @@ struct ContentView: View {
         guard !isPickingRandomDay else { return }
         randomPickToken += 1
         let token = randomPickToken
+        // Set immediately (both paths) so a rapid second tap is ignored by the
+        // guard above instead of falling through to a duplicate pick.
         isPickingRandomDay = true
 
         if dateSourceMode != .random {
             dateSourceMode = .random
         }
+
+        // Fast path: the next random day was pre-picked and its first photos
+        // pre-downloaded — switch instantly to already-sharp images.
+        if let day = prewarmedRandomDay {
+            prewarmedRandomDay = nil
+            prewarmedRandomAssets = []
+            randomPickedDay = day
+            let interval = interval(for: .day, referenceDate: day, calendar: Calendar.current)
+            rebuildSource(for: interval) {
+                guard token == randomPickToken else { return }
+                isPickingRandomDay = false
+                recalcTodayPendingCountFast()
+                bootstrapBuffer(force: true)
+                presentTopBannerIfNeeded()
+                prewarmNextRandomDay()   // queue the following day
+            }
+            return
+        }
+
+        // Slow path: nothing pre-warmed yet (first tap, or restricted to Wi-Fi
+        // while on cellular). Pick on demand, then start pre-warming for next time.
         pickRandomDayWithPhotos { day in
             guard token == randomPickToken else { return }
             isPickingRandomDay = false
@@ -1099,7 +1290,86 @@ struct ContentView: View {
                 recalcTodayPendingCountFast()
                 bootstrapBuffer(force: true)
                 presentTopBannerIfNeeded()
+                prewarmNextRandomDay()
             }
+        }
+    }
+
+    // MARK: - Random-day pre-warming
+
+    /// Whether proactive iCloud prefetching is currently allowed by the user's
+    /// network preference.
+    private var prefetchAllowedNow: Bool {
+        guard NetworkMonitor.shared.isConnected else { return false }
+        return prewarmUseCellular || NetworkMonitor.shared.isUnmetered
+    }
+
+    /// Pre-pick the next random day and pre-download its first photos so the next
+    /// "Random" tap is instant and crisp. No-op if one is already warmed or the
+    /// network preference disallows it right now.
+    private func prewarmNextRandomDay() {
+        guard prewarmedRandomDay == nil, !isPrewarmingRandom, prefetchAllowedNow else { return }
+        isPrewarmingRandom = true
+
+        pickRandomDayWithPhotos { day in
+            // Snapshot marked assets on the main thread; the prewarm must skip them
+            // so the first photo the user actually sees (the first *unmarked* one)
+            // is the one we pre-download.
+            var marked = self.sessionProcessed
+            for (id, tag) in self.tagCache where tag.status != "pending" { marked.insert(id) }
+
+            DispatchQueue.global(qos: .utility).async {
+                let assets = self.fetchDayAssets(day, limit: Self.randomPrewarmCount, excluding: marked)
+                DispatchQueue.main.async {
+                    self.isPrewarmingRandom = false
+                    guard !assets.isEmpty, self.prewarmedRandomDay == nil else { return }
+                    // Stop the previously warmed set so caching doesn't grow unbounded.
+                    if !self.cachedPrewarmAssets.isEmpty {
+                        self.setPrewarmCaching(self.cachedPrewarmAssets, enabled: false)
+                    }
+                    self.prewarmedRandomDay = day
+                    self.prewarmedRandomAssets = assets
+                    self.cachedPrewarmAssets = assets
+                    self.setPrewarmCaching(assets, enabled: true)
+                }
+            }
+        }
+    }
+
+    /// Fetch the first `limit` *unmarked* assets (newest first) of a given day,
+    /// skipping anything the user has already sorted.
+    private func fetchDayAssets(_ day: Date, limit: Int, excluding: Set<String>) -> [PHAsset] {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: day)
+        let end = cal.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(24 * 3600)
+        let opt = PHFetchOptions()
+        opt.predicate = NSPredicate(format: "creationDate >= %@ AND creationDate < %@", start as NSDate, end as NSDate)
+        opt.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        let res = PHAsset.fetchAssets(with: opt)
+        var arr: [PHAsset] = []
+        arr.reserveCapacity(limit)
+        res.enumerateObjects { a, _, stop in
+            if excluding.contains(a.localIdentifier) { return }
+            arr.append(a)
+            if arr.count >= limit { stop.pointee = true }
+        }
+        return arr
+    }
+
+    /// Start/stop PHCachingImageManager pre-download for the given assets at the
+    /// exact card target the swipe stack requests, so warmed images are reused.
+    private func setPrewarmCaching(_ assets: [PHAsset], enabled: Bool) {
+        guard !assets.isEmpty else { return }
+        let scale = UIScreen.main.scale
+        let target = CGSize(width: cardWidth * scale, height: cardHeight * scale)
+        let opt = PHImageRequestOptions()
+        opt.isNetworkAccessAllowed = true
+        opt.deliveryMode = .highQualityFormat
+        opt.resizeMode = .fast
+        if enabled {
+            imageManager.startCachingImages(for: assets, targetSize: target, contentMode: .aspectFit, options: opt)
+        } else {
+            imageManager.stopCachingImages(for: assets, targetSize: target, contentMode: .aspectFit, options: opt)
         }
     }
 
@@ -1208,10 +1478,16 @@ struct ContentView: View {
 
             cardImageRequestIDs[id] = loadCardState(for: asset) { card in
                 DispatchQueue.main.async {
-                    self.loadingIDs.remove(id)
                     guard revision == self.sourceRevision else { return }
 
-                    // Upgrade path: if card already exists (degraded delivered earlier), update its image
+                    // .opportunistic delivers twice (degraded then full). The first
+                    // delivery removes the id from loadingIDs; a later delivery is an
+                    // upgrade. We must distinguish them so a late high-res upgrade for
+                    // an already-swiped asset can't resurrect it into the buffer.
+                    let isFirstDelivery = (self.loadingIDs.remove(id) != nil)
+
+                    // Upgrade path: if the card is still on screen / queued, swap in
+                    // the higher-quality image in place.
                     if self.activeCard?.asset.localIdentifier == id {
                         self.activeCard = card
                         return
@@ -1221,12 +1497,19 @@ struct ContentView: View {
                         return
                     }
 
+                    // Only the FIRST delivery of an asset the user hasn't acted on
+                    // may create a new card. This blocks the "swiped card comes back"
+                    // bug where a late upgrade re-inserted a dismissed asset.
+                    guard isFirstDelivery,
+                          !self.sessionProcessed.contains(id),
+                          self.isUnmarkedTodayAsset(asset) else { return }
+
                     self.insertBufferInTodayOrder(card)
 
                     if self.activeCard == nil, !self.buffer.isEmpty {
                         self.activeCard = self.buffer.removeFirst()
+                        // Media prep is driven by onChange(of: activeCard.id).
                         self.syncNoteForCurrent()
-                        self.prepareMediaForCurrent()
                         self.refreshFilmstripSnapshot()
                     }
                 }
@@ -1323,19 +1606,127 @@ struct ContentView: View {
     // MARK: - Media helpers
     private func prepareMediaForCurrent() {
         guard let asset = activeCard?.asset else { return }
-        if asset.mediaType == .video { loadVideo(for: asset) }
+        if asset.mediaType == .video {
+            loadVideo(for: asset)
+        } else if asset.mediaSubtypes.contains(.photoLive) {
+            preloadLivePhoto(for: asset)
+        }
+        // Pre-download the next few upcoming Live Photos so they're instant on arrival.
+        warmUpcomingLivePhotos()
+    }
+
+    /// Pre-download full Live Photos for the next cards in the buffer so that by
+    /// the time the user swipes to one, it's ready to play with no spinner.
+    private func warmUpcomingLivePhotos() {
+        let upcoming = buffer.prefix(6).map(\.asset)
+            .filter { $0.mediaSubtypes.contains(.photoLive) }
+        var warmed = 0
+        for asset in upcoming {
+            if warmed >= Self.liveWarmAhead { break }
+            warmed += 1
+            let id = asset.localIdentifier
+            if livePhotoCache[id] != nil || liveWarmInFlight.contains(id) { continue }
+            liveWarmInFlight.insert(id)
+
+            let opt = PHLivePhotoRequestOptions()
+            opt.isNetworkAccessAllowed = true
+            opt.deliveryMode = .highQualityFormat
+            let scale = UIScreen.main.scale
+            let target = CGSize(width: cardWidth * scale, height: cardHeight * scale)
+
+            PHImageManager.default().requestLivePhoto(
+                for: asset, targetSize: target, contentMode: .aspectFit, options: opt
+            ) { live, _ in
+                DispatchQueue.main.async {
+                    self.liveWarmInFlight.remove(id)
+                    guard let live else { return }
+                    self.cacheLivePhoto(live, for: id)
+                }
+            }
+        }
+    }
+
+    private func cacheLivePhoto(_ live: PHLivePhoto, for id: String) {
+        livePhotoCache[id] = live
+        guard livePhotoCache.count > Self.liveCacheCap else { return }
+        // Evict entries no longer near the current position.
+        let keep = Set([activeCard?.asset.localIdentifier].compactMap { $0 }
+                       + buffer.map(\.asset.localIdentifier))
+        for k in livePhotoCache.keys where !keep.contains(k) {
+            livePhotoCache.removeValue(forKey: k)
+            if livePhotoCache.count <= Self.liveCacheCap { break }
+        }
+    }
+
+    /// Apple-style instant Live Photo: load the Live Photo as soon as the card
+    /// appears and keep the PHLivePhotoView mounted (but invisible) so it has time
+    /// to prepare. Tapping then only flips playback — no request, no fresh view,
+    /// no decode stall (the bug that made the previous prefetch "not play").
+    private func preloadLivePhoto(for asset: PHAsset) {
+        let assetID = asset.localIdentifier
+        guard livePhotoAssetID != assetID else { return }   // already loaded
+
+        // Look-ahead cache hit: it was pre-downloaded while on a previous card.
+        if let cached = livePhotoCache[assetID] {
+            livePhoto = cached
+            livePhotoAssetID = assetID
+            return
+        }
+
+        if livePhotoPreloadID != PHInvalidImageRequestID {
+            PHImageManager.default().cancelImageRequest(livePhotoPreloadID)
+            livePhotoPreloadID = PHInvalidImageRequestID
+        }
+
+        let opt = PHLivePhotoRequestOptions()
+        opt.isNetworkAccessAllowed = true
+        // .highQualityFormat forces the FULL Live Photo (incl. the iCloud video
+        // component). .opportunistic often returns only a still placeholder for
+        // iCloud assets, which is why historical Live Photos wouldn't animate.
+        opt.deliveryMode = .highQualityFormat
+
+        let scale = UIScreen.main.scale
+        let target = CGSize(width: cardWidth * scale, height: cardHeight * scale)
+
+        livePhotoPreloadID = PHImageManager.default().requestLivePhoto(
+            for: asset,
+            targetSize: target,
+            contentMode: .aspectFit,
+            options: opt
+        ) { live, _ in
+            guard let live else { return }
+            DispatchQueue.main.async {
+                self.cacheLivePhoto(live, for: assetID)
+                guard self.activeCard?.asset.localIdentifier == assetID else { return }
+                self.livePhoto = live
+                self.livePhotoAssetID = assetID
+                // If the user already tapped while this was downloading, play now.
+                if self.pendingLivePlay {
+                    self.pendingLivePlay = false
+                    self.isLoadingLivePhoto = false
+                    self.isPlayingLivePhoto = true
+                }
+            }
+        }
     }
 
     private func stopAllMedia() {
         // Release audio focus so external audio (e.g., Music/Podcast) can resume.
         AudioSessionManager.endVideoAudio()
         cancelCurrentVideoRequests()
+        if livePhotoPreloadID != PHInvalidImageRequestID {
+            PHImageManager.default().cancelImageRequest(livePhotoPreloadID)
+            livePhotoPreloadID = PHInvalidImageRequestID
+        }
         player?.pause()
         player = nil
         currentVideoAssetID = nil
         videoCloudProgress = nil
         isPlayingLivePhoto = false
         livePhoto = nil
+        livePhotoAssetID = nil
+        isLoadingLivePhoto = false
+        pendingLivePlay = false
         isMuted = true
 
         if let obs = videoEndObserver {
@@ -1489,7 +1880,9 @@ struct ContentView: View {
             return
         }
         let activeID = activeCard?.asset.localIdentifier
-        let centerIndex = todayAssets.firstIndex { $0.localIdentifier == activeID }
+        // O(1) center lookup via the prebuilt id→index map instead of an O(n)
+        // firstIndex scan on every swipe. Falls back to the first unmarked asset.
+        let centerIndex = activeID.flatMap { todayOrderByID[$0] }
             ?? todayAssets.firstIndex(where: { isUnmarkedTodayAsset($0) })
             ?? 0
 
@@ -1530,35 +1923,30 @@ struct ContentView: View {
         guard let asset = activeCard?.asset,
               asset.mediaSubtypes.contains(.photoLive) else { return }
 
+        // Tapped again while a slow (iCloud) load is in progress — cancel it.
+        if isLoadingLivePhoto {
+            isLoadingLivePhoto = false
+            pendingLivePlay = false
+            return
+        }
+
         if isPlayingLivePhoto {
             isPlayingLivePhoto = false
             return
         }
 
-        let opt = PHLivePhotoRequestOptions()
-        opt.isNetworkAccessAllowed = true
-        opt.deliveryMode = .opportunistic
-
-        let scale = UIScreen.main.scale
-        let targetSize = CGSize(width: UIScreen.main.bounds.width * scale,
-                                height: UIScreen.main.bounds.height * scale)
-
-        PHImageManager.default().requestLivePhoto(
-            for: asset,
-            targetSize: targetSize,
-            contentMode: .aspectFit,
-            options: opt
-        ) { live, info in
-            guard let live else { return }
-            if let degraded = info?[PHLivePhotoInfoIsDegradedKey] as? Bool, degraded {
-                return
-            }
-
-            DispatchQueue.main.async {
-                self.livePhoto = live
-                self.isPlayingLivePhoto = true
-            }
+        // Preloaded and warm → instant play (the Apple-like case).
+        if livePhoto != nil, livePhotoAssetID == asset.localIdentifier {
+            isPlayingLivePhoto = true
+            return
         }
+
+        // Not ready yet (historical iCloud Live Photo still downloading). Show a
+        // spinner and auto-play the moment the background load finishes — no
+        // second request, so no double download.
+        pendingLivePlay = true
+        isLoadingLivePhoto = true
+        preloadLivePhoto(for: asset)
     }
 
     // MARK: - Share
@@ -1880,8 +2268,28 @@ struct ContentView: View {
         videoCloudProgress = nil
         loadingIDs.removeAll()
 
-        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [lastAssetID], options: nil)
-        guard let asset = fetch.firstObject else {
+        // PHAsset.fetchAssets is synchronous Photos I/O — running it on the main
+        // thread made every undo tap visibly stutter. Resolve it on a background
+        // queue, then hop back to main for all UI/state work.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [lastAssetID], options: nil)
+            let asset = fetch.firstObject
+            DispatchQueue.main.async {
+                // The source may have been rebuilt (newer revision) while we were
+                // fetching; bail if this undo is stale (and clear the in-flight
+                // flag so the undo button doesn't get stuck disabled).
+                guard self.isUndoRestoring else { return }
+                guard revision == self.sourceRevision else {
+                    self.isUndoRestoring = false
+                    return
+                }
+                self.continueUndo(asset: asset, revision: revision)
+            }
+        }
+    }
+
+    private func continueUndo(asset: PHAsset?, revision: Int) {
+        guard let asset else {
             rebuildCurrentSource {
                 recalcTodayPendingCountFast()
                 bootstrapBuffer(force: true)

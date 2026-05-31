@@ -13,6 +13,7 @@ struct PhotosCleanApp: App {
     @StateObject private var storeManager = StoreManager()
     @StateObject private var paywallGate = PaywallGate()
     @StateObject private var storageStats = StorageStats()
+    @StateObject private var ratingPrompt = RatingPrompt()
 
     // 初始化共享 ModelContainer（三级 fallback，确保 app 至少能打开）
     var sharedModelContainer: ModelContainer = {
@@ -62,6 +63,7 @@ struct PhotosCleanApp: App {
                 .environmentObject(storeManager)
                 .environmentObject(paywallGate)
                 .environmentObject(storageStats)
+                .environmentObject(ratingPrompt)
         }
         .modelContainer(sharedModelContainer)
         .onChange(of: scenePhase) { _, newPhase in
@@ -83,13 +85,23 @@ class PhotoLibraryObserver: NSObject, PHPhotoLibraryChangeObserver {
         PHPhotoLibrary.shared().register(self)
     }
 
+    private var reloadDebounce: DispatchWorkItem?
+
     func photoLibraryDidChange(_ changeInstance: PHChange) {
+        // Photos can fire this rapidly during the app's own deletes and during
+        // iCloud sync. Each ReloadPhotos triggers a full source refresh on the
+        // main thread, so coalesce bursts into a single reload after 0.5s idle.
         DispatchQueue.main.async {
-            NotificationCenter.default.post(
-                name: NSNotification.Name("ReloadPhotos"),
-                object: nil
-            )
-            WidgetCenter.shared.reloadAllTimelines()
+            self.reloadDebounce?.cancel()
+            let work = DispatchWorkItem {
+                NotificationCenter.default.post(
+                    name: NSNotification.Name("ReloadPhotos"),
+                    object: nil
+                )
+                WidgetCenter.shared.reloadAllTimelines()
+            }
+            self.reloadDebounce = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
         }
     }
 }

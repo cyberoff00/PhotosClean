@@ -8,6 +8,9 @@ struct LibraryView: View {
 
     @Query private var allTags: [PhotoTag]
     @State private var folderCounts: [String: Int] = [:]
+    /// Guards against a slower earlier count finishing after a newer one and
+    /// overwriting it with stale numbers on rapid tab switches.
+    @State private var countsToken = 0
 
     @AppStorage("hint_library_category_dismissed") private var categoryHintDismissed = false
     @AppStorage("hint_library_todelete_dismissed") private var toDeleteHintDismissed = false
@@ -206,52 +209,43 @@ struct LibraryView: View {
     }
 
     func calculateCounts() {
-        let fetchedAssets = PHAsset.fetchAssets(with: .image, options: nil)
-        var assetIDs: [String] = []
-        assetIDs.reserveCapacity(fetchedAssets.count)
-        fetchedAssets.enumerateObjects { asset, _, _ in
-            assetIDs.append(asset.localIdentifier)
-        }
-
-        // Keep only the newest tag for each assetID to avoid duplicated historical records
-        // affecting folder counts.
-        var latestTagByID: [String: PhotoTag] = [:]
-        latestTagByID.reserveCapacity(allTags.count)
+        countsToken += 1
+        let token = countsToken
+        // Snapshot the newest status per asset on the main thread — SwiftData
+        // models (allTags) aren't safe to touch off the main context. This is a
+        // cheap in-memory pass; the expensive Photos work happens below.
+        var latestStatusByID: [String: String] = [:]
+        var latestDateByID: [String: Date] = [:]
+        latestStatusByID.reserveCapacity(allTags.count)
         for tag in allTags {
-            if let existing = latestTagByID[tag.assetID] {
-                if tag.createdAt > existing.createdAt {
-                    latestTagByID[tag.assetID] = tag
+            if let d = latestDateByID[tag.assetID], tag.createdAt <= d { continue }
+            latestDateByID[tag.assetID] = tag.createdAt
+            latestStatusByID[tag.assetID] = tag.status
+        }
+
+        // Fetching + enumerating the whole photo library is the ~1s hitch when
+        // switching to this tab. Run it off the main thread and count in a single
+        // pass (no intermediate ID array), then publish back on the main thread.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fetched = PHAsset.fetchAssets(with: .image, options: nil)
+            var all = 0, keep = 0, maybe = 0, delete = 0, pending = 0
+            fetched.enumerateObjects { asset, _, _ in
+                all += 1
+                switch latestStatusByID[asset.localIdentifier] {
+                case "keep":   keep += 1
+                case "maybe":  maybe += 1
+                case "delete": delete += 1
+                default:       pending += 1   // nil/pending/unknown -> pending bucket
                 }
-            } else {
-                latestTagByID[tag.assetID] = tag
+            }
+            DispatchQueue.main.async {
+                guard token == self.countsToken else { return }
+                self.folderCounts = [
+                    "all": all, "keep": keep, "maybe": maybe,
+                    "delete": delete, "pending": pending
+                ]
             }
         }
-
-        var keepCount = 0
-        var maybeCount = 0
-        var deleteCount = 0
-        var pendingCount = 0
-
-        for assetID in assetIDs {
-            let status = latestTagByID[assetID]?.status
-            switch status {
-            case "keep":
-                keepCount += 1
-            case "maybe":
-                maybeCount += 1
-            case "delete":
-                deleteCount += 1
-            default:
-                // Keep in sync with PhotoGrid pending filter (nil/pending/unknown -> pending bucket).
-                pendingCount += 1
-            }
-        }
-
-        folderCounts["all"] = assetIDs.count
-        folderCounts["keep"] = keepCount
-        folderCounts["maybe"] = maybeCount
-        folderCounts["delete"] = deleteCount
-        folderCounts["pending"] = pendingCount
     }
 }
 

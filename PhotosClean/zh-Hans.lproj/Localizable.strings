@@ -216,6 +216,11 @@
 "settings.rate_us" = "给我们评分";
 "settings.legal.section" = "法律";
 
+/* 下载 / 预加载 */
+"settings.download.section" = "下载";
+"settings.prewarm.cellular" = "使用蜂窝移动数据";
+"settings.prewarm.cellular.footer" = "提前下载下一个随机日的照片，让它们一打开就清晰。关闭后仅在 Wi-Fi 下预加载。";
+
 /* Daily Quota Upgrade Card */
 "quota.title" = "今日免费额度已用完";
 "quota.subtitle" = "每天可以免费整理 20 张照片\n升级后不再有数量限制";
@@ -237,3 +242,26 @@
 "goal.subtitle" = "今天已标记 %@ 待清理";
 "goal.hint" = "去「待删除」相册按下「全部删除」，把空间真正释放出来。";
 "goal.cta" = "知道了";
+
+/* 一键清理 */
+"cleanup.auth.title" = "需要相册权限";
+"cleanup.auth.message" = "要删除照片，请在设置中允许完整的相册访问权限。";
+"cleanup.auth.settings" = "打开设置";
+
+/* 评分门 */
+"rating.ask.title" = "喜欢 TastyTidy 吗？";
+"rating.ask.message" = "清理得不错！想听听你的使用感受。";
+"rating.ask.like" = "很喜欢！";
+"rating.ask.dislike" = "一般般";
+"rating.ask.later" = "以后再说";
+
+/* App 内反馈 */
+"feedback.title" = "反馈";
+"feedback.intro" = "抱歉还没让你满意。说说哪里不顺手、或者你希望有什么功能——每一条都会由开发者亲自查看。";
+"feedback.message.label" = "你的反馈";
+"feedback.message.placeholder" = "哪里可以做得更好？";
+"feedback.contact.label" = "邮箱（选填）";
+"feedback.contact.placeholder" = "方便我们回复你";
+"feedback.send" = "发送";
+"feedback.nomail.title" = "未找到邮件应用";
+"feedback.nomail.message" = "请通过邮件联系我们：%@";

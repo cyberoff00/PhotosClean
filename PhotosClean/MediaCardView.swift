@@ -11,6 +11,7 @@ struct MediaCardView: View {
 
     @Binding var livePhoto: PHLivePhoto?
     @Binding var isPlayingLivePhoto: Bool
+    let isLoadingLivePhoto: Bool
 
     // Zoom (outer uses zoomScale to disable swipe)
     @Binding var zoomScale: CGFloat
@@ -85,8 +86,12 @@ struct MediaCardView: View {
         .frame(width: cardWidth, height: cardHeight)
         .clipped()
         .overlay {
-            if isPlayingLivePhoto, let live = livePhoto {
+            // Mount as soon as the Live Photo is loaded so PHLivePhotoView has time
+            // to prepare; keep it invisible until playing. Tapping then plays
+            // instantly instead of stalling on a freshly-created view.
+            if let live = livePhoto {
                 LivePhotoView(livePhoto: live, isPlaying: $isPlayingLivePhoto)
+                    .opacity(isPlayingLivePhoto ? 1 : 0)
                     .allowsHitTesting(false)
             }
         }
@@ -187,10 +192,18 @@ struct MediaCardView: View {
             HStack {
                 if asset.mediaSubtypes.contains(.photoLive) {
                     Button(action: onToggleLive) {
-                        Image(systemName: isPlayingLivePhoto ? "stop.circle.fill" : "livephoto")
-                            .padding(10)
-                            .background(.ultraThinMaterial)
-                            .clipShape(Circle())
+                        Group {
+                            if isLoadingLivePhoto {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: isPlayingLivePhoto ? "stop.circle.fill" : "livephoto")
+                            }
+                        }
+                        .frame(width: 20, height: 20)
+                        .padding(10)
+                        .background(.ultraThinMaterial)
+                        .clipShape(Circle())
                     }
                 }
                 Spacer()

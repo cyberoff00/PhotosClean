@@ -67,6 +67,7 @@ final class StorageStats: ObservableObject {
     private var widgetReloadTask: Task<Void, Never>?
     private var pendingProgressDebounceTask: Task<Void, Never>?
     private var pendingProgressLatestBytes: Int64 = 0
+    private var saveCacheDebounceTask: Task<Void, Never>?
 
     private static let appGroupID = "group.com.claire.TastyTidy"
 
@@ -306,10 +307,14 @@ final class StorageStats: ObservableObject {
                 }
             }
             DispatchQueue.main.async {
+                // Mutating @Published preciseSizes already emits objectWillChange,
+                // so no explicit send() is needed (it would double the re-render).
                 for (id, size) in batch { self.preciseSizes[id] = size }
                 missing.forEach { self.inflightIDs.remove($0.localIdentifier) }
-                self.saveCacheToDisk()
-                self.objectWillChange.send()
+                // Debounced + off-main: encoding up to 5000 entries and writing
+                // atomically used to run on the main thread on every batch, which
+                // froze the *whole* app periodically while marking deletes.
+                self.scheduleSaveCacheToDisk()
             }
         }
     }
@@ -368,15 +373,31 @@ final class StorageStats: ObservableObject {
         preciseSizes = decoded
     }
 
-    private func saveCacheToDisk() {
-        var snap = preciseSizes
-        if snap.count > 5000 {
-            let trimmed = Array(snap.prefix(5000))
-            snap = Dictionary(uniqueKeysWithValues: trimmed)
-            preciseSizes = snap
+    /// Coalesces rapid precache completions into at most one disk write per
+    /// ~600ms, and performs the (expensive) JSON encode + atomic write off the
+    /// main thread so it never stalls UI / button taps.
+    private func scheduleSaveCacheToDisk() {
+        saveCacheDebounceTask?.cancel()
+        saveCacheDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.saveCacheToDisk()
         }
-        guard let data = try? JSONEncoder().encode(snap) else { return }
-        try? data.write(to: cacheURL, options: .atomic)
+    }
+
+    private func saveCacheToDisk() {
+        // Trim mutates @Published preciseSizes, so it must stay on the main actor.
+        if preciseSizes.count > 5000 {
+            let trimmed = Array(preciseSizes.prefix(5000))
+            preciseSizes = Dictionary(uniqueKeysWithValues: trimmed)
+        }
+        // Snapshot, then encode + write on the background work queue.
+        let snap = preciseSizes
+        let url = cacheURL
+        workQueue.async {
+            guard let data = try? JSONEncoder().encode(snap) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
     }
 }
 

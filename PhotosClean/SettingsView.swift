@@ -7,6 +7,8 @@ struct SettingsView: View {
     @Environment(\.openURL) private var openURL
 
     @State private var showFreedExplanation = false
+    @State private var showFeedback = false
+    @AppStorage("prewarm_use_cellular") private var prewarmUseCellular: Bool = true
 
     private let appStoreAppID = "6757628907"
     private let legalURL = URL(string: "https://seasoned-author-d9f.notion.site/TastyTidy-Privacy-Policy-Terms-of-Service-2db01b2ced5980e485e7ce0495e0b40e?pvs=143") ?? URL(string: "https://apple.com")!
@@ -65,6 +67,16 @@ struct SettingsView: View {
                 }
             }
 
+            Section {
+                Toggle(isOn: $prewarmUseCellular) {
+                    Label("settings.prewarm.cellular".localized, systemImage: "antenna.radiowaves.left.and.right")
+                }
+            } header: {
+                Text("settings.download.section".localized)
+            } footer: {
+                Text("settings.prewarm.cellular.footer".localized)
+            }
+
             Section("settings.general.section".localized) {
                 Button {
                     openAppStore()
@@ -76,6 +88,12 @@ struct SettingsView: View {
                     openAppStoreReview()
                 } label: {
                     Label("settings.rate_us".localized, systemImage: "star.bubble")
+                }
+
+                Button {
+                    showFeedback = true
+                } label: {
+                    Label("feedback.title".localized, systemImage: "envelope")
                 }
             }
 
@@ -95,6 +113,9 @@ struct SettingsView: View {
             Button("common.ok".localized, role: .cancel) {}
         } message: {
             Text("settings.cleanup.total.explain".localized)
+        }
+        .sheet(isPresented: $showFeedback) {
+            FeedbackView()
         }
     }
 

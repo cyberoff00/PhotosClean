@@ -299,6 +299,7 @@ struct RetroCleanView: View {
                             displayImage: card.image,
                             livePhoto: $livePhoto,
                             isPlayingLivePhoto: $isPlayingLivePhoto,
+                            isLoadingLivePhoto: false,
                             zoomScale: $imageScale,
                             zoomResetToken: zoomResetToken,
                             player: $player,
@@ -453,6 +454,12 @@ struct RetroCleanView: View {
             }
             self.paywallGate.recordSwipe(isPremium: self.storeManager.hasUnlockedPremium)
 
+            // Hard wall: auto-present the paywall the moment the daily free quota runs out.
+            if !self.storeManager.hasUnlockedPremium,
+               self.paywallGate.isQuotaExhausted,
+               !self.paywallGate.showPaywall {
+                self.paywallGate.showPaywall = true
+            }
 
             self.stopAllMedia()
             self.resetImageZoom()

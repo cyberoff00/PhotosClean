@@ -233,6 +233,11 @@
 "settings.rate_us" = "Rate Us";
 "settings.legal.section" = "Legal";
 
+/* Download / prefetch */
+"settings.download.section" = "Downloads";
+"settings.prewarm.cellular" = "Use Cellular Data";
+"settings.prewarm.cellular.footer" = "Preloads upcoming random-day photos so they appear sharp instantly. Turn off to preload only on Wi-Fi.";
+
 /* Daily Quota Upgrade Card */
 "quota.title" = "Daily free limit reached";
 "quota.subtitle" = "You can sort 20 photos for free each day.\nUpgrade for unlimited sorting.";
@@ -254,3 +259,26 @@
 "goal.subtitle" = "You've marked %@ to clean today.";
 "goal.hint" = "Open the To Delete folder and tap Delete All to actually free the space.";
 "goal.cta" = "Got it";
+
+/* One-tap cleanup */
+"cleanup.auth.title" = "Photos Access Needed";
+"cleanup.auth.message" = "To delete photos, allow full Photos access in Settings.";
+"cleanup.auth.settings" = "Open Settings";
+
+/* Rating gate */
+"rating.ask.title" = "Enjoying TastyTidy?";
+"rating.ask.message" = "Nice cleanup! We'd love to know how it's going.";
+"rating.ask.like" = "I love it!";
+"rating.ask.dislike" = "Not really";
+"rating.ask.later" = "Maybe later";
+
+/* In-app feedback */
+"feedback.title" = "Feedback";
+"feedback.intro" = "Sorry it's not quite right yet. Tell us what's bothering you or what you'd like to see — every message is read by the developer.";
+"feedback.message.label" = "Your feedback";
+"feedback.message.placeholder" = "What could be better?";
+"feedback.contact.label" = "Email (optional)";
+"feedback.contact.placeholder" = "So we can reply";
+"feedback.send" = "Send";
+"feedback.nomail.title" = "No mail app found";
+"feedback.nomail.message" = "Please email us at %@";

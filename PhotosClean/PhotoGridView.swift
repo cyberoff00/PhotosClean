@@ -28,6 +28,7 @@ struct PhotoGridView: View {
 
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject var storageStats: StorageStats
+    @EnvironmentObject var ratingPrompt: RatingPrompt
     @Query private var allTags: [PhotoTag]
 
     @State private var assets: [PHAsset] = []
@@ -696,17 +697,40 @@ struct PhotoGridView: View {
     }
 
     /// 后台一次性构建 assetID → (year, month) 字典。Calendar 缓存一次复用。
+    // An asset's (year, month) never changes, so cache it across reloads. On the
+    // second+ load only brand-new asset IDs pay the ICU dateComponents cost.
+    private static var yearMonthCache: [String: (Int, Int)] = [:]
+    private static let yearMonthCacheLock = NSLock()
+
     private static func computeYearMonthMap(for assets: [PHAsset]) -> [String: (Int, Int)] {
         var map: [String: (Int, Int)] = [:]
         map.reserveCapacity(assets.count)
         let calendar = Calendar.current
         let comps: Set<Calendar.Component> = [.year, .month]
+
+        yearMonthCacheLock.lock()
+        let cache = yearMonthCache
+        yearMonthCacheLock.unlock()
+
+        var freshlyComputed: [String: (Int, Int)] = [:]
         for asset in assets {
+            let id = asset.localIdentifier
+            if let cached = cache[id] {
+                map[id] = cached
+                continue
+            }
             guard let date = asset.creationDate else { continue }
             let c = calendar.dateComponents(comps, from: date)
             if let y = c.year, let m = c.month {
-                map[asset.localIdentifier] = (y, m)
+                map[id] = (y, m)
+                freshlyComputed[id] = (y, m)
             }
+        }
+
+        if !freshlyComputed.isEmpty {
+            yearMonthCacheLock.lock()
+            for (id, ym) in freshlyComputed { yearMonthCache[id] = ym }
+            yearMonthCacheLock.unlock()
         }
         return map
     }
@@ -868,6 +892,7 @@ struct PhotoGridView: View {
                         // allAssetsSnapshot + statusByAssetID 重新过滤，结果正确。
 
                         storageStats.recordCleanup(bytes: bytes)
+                        ratingPrompt.registerCleanup()
                         WidgetCenter.shared.reloadAllTimelines()
                         if exitSelection { exitSelectionMode() }
                     }
@@ -1021,30 +1046,43 @@ struct PhotoGridView: View {
 
         let targetSize = CGSize(width: 240, height: 240)
 
-        for (idx, asset) in list.enumerated() {
-            if idx % 40 == 0 {
-                await MainActor.run {
-                    self.aiProgressText = "ai.progress.analyzing".localized(with: idx, list.count)
-                }
-            }
+        // Process in windows of up to `maxConcurrent` images at once instead of
+        // one-at-a-time. Each image is an independent disk-load + CIFilter pass,
+        // so ~4-wide concurrency turns a 5-10s serial scan into ~1/4 the time.
+        let maxConcurrent = 4
+        var index = 0
+        while index < list.count {
+            let upper = min(index + maxConcurrent, list.count)
+            let slice = Array(list[index..<upper])
 
-            let isBlurry = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-                manager.requestImage(
-                    for: asset,
-                    targetSize: targetSize,
-                    contentMode: .aspectFill,
-                    options: options
-                ) { image, _ in
-                    guard let image else {
-                        cont.resume(returning: false)
-                        return
+            await withTaskGroup(of: String?.self) { group in
+                for asset in slice {
+                    group.addTask {
+                        let isBlurry = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                            manager.requestImage(
+                                for: asset,
+                                targetSize: targetSize,
+                                contentMode: .aspectFill,
+                                options: options
+                            ) { image, _ in
+                                guard let image else {
+                                    cont.resume(returning: false)
+                                    return
+                                }
+                                cont.resume(returning: isLikelyBlurry(image))
+                            }
+                        }
+                        return isBlurry ? asset.localIdentifier : nil
                     }
-                    cont.resume(returning: isLikelyBlurry(image))
+                }
+                for await id in group {
+                    if let id { result.insert(id) }
                 }
             }
 
-            if isBlurry {
-                result.insert(asset.localIdentifier)
+            index = upper
+            await MainActor.run {
+                self.aiProgressText = "ai.progress.analyzing".localized(with: index, list.count)
             }
         }
         return result
