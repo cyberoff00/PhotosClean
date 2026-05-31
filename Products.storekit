@@ -14,7 +14,21 @@
 
   ],
   "products" : [
-
+    {
+      "displayPrice" : "39.99",
+      "familyShareable" : false,
+      "internalID" : "A1B2C3D4",
+      "localizations" : [
+        {
+          "description" : "Pay once, unlock all features forever.",
+          "displayName" : "Lifetime",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.claire.tastytidy.forever",
+      "referenceName" : "forever",
+      "type" : "NonConsumable"
+    }
   ],
   "settings" : {
     "_askToBuyEnabled" : false,
@@ -110,11 +124,15 @@
           "codeOffers" : [
 
           ],
-          "displayPrice" : "17.99",
+          "displayPrice" : "19.99",
           "familyShareable" : true,
           "groupNumber" : 1,
           "internalID" : "41D16E75",
-          "introductoryOffer" : null,
+          "introductoryOffer" : {
+            "internalID" : "B7C8D9E0",
+            "paymentMode" : "free",
+            "subscriptionPeriod" : "P1W"
+          },
           "localizations" : [
             {
               "description" : "",

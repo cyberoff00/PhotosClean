@@ -112,12 +112,17 @@
 "sub.plan.quarterly.title" = "Quarterly";
 "sub.plan.quarterly.subtitle" = "%@ / 3 months";
 
-// Lifetime plan
+// Yearly plan
 "sub.plan.yearly.title" = "Yearly";
 "sub.plan.yearly.subtitle" = "%@ / year";
 "sub.cta.then.yearly" = "Then %@ / year";
 "sub.type.yearly" = "Yearly";
 "sub.badge.bestvalue" = "Best Value";
+
+// Lifetime plan
+"sub.plan.lifetime.title" = "Lifetime";
+"sub.plan.lifetime.subtitle" = "%@ · one-time payment";
+"sub.badge.lifetime" = "Pay once";
 
 
 // Default plan title
@@ -151,6 +156,12 @@
 
 // Action buttons
 "sub.manage.subscription" = "Manage Subscription";
+
+// Prompt shown after buying Lifetime while a subscription is still active
+"sub.lifetime.cancelsub.title" = "Cancel your subscription";
+"sub.lifetime.cancelsub.message" = "You now have lifetime access. Your existing subscription won't cancel automatically — please turn off auto-renew so you aren't charged again.";
+"sub.lifetime.cancelsub.action" = "Cancel Subscription";
+"sub.lifetime.cancelsub.later" = "Later";
 
 
 /* ============================================

@@ -108,6 +108,11 @@
 "sub.type.yearly" = "年付";
 "sub.badge.bestvalue" = "性价比高";
 
+// 终身买断
+"sub.plan.lifetime.title" = "终身买断";
+"sub.plan.lifetime.subtitle" = "%@ · 一次买断";
+"sub.badge.lifetime" = "一次付清";
+
 "sub.plan.default.title" = "高级版本";
 
 // 标签与按钮
@@ -115,6 +120,7 @@
 "sub.cta.subscribe" = "立即订阅";
 "sub.cta.trial7" = "开始免费试用";
 "sub.cta.lifetime" = "购买终身版本";
+"sub.cta.lifetime.detail" = "一次付清，永久使用";
 
 // 续订/详细描述
 "sub.cta.then.monthly" = "之后 %@ / 月";
@@ -138,6 +144,12 @@
 // 操作
 "sub.manage.subscription" = "管理订阅";
 "sub.change.plan" = "更改方案";
+
+// 买断后仍有活跃订阅时的提示
+"sub.lifetime.cancelsub.title" = "请取消你的订阅";
+"sub.lifetime.cancelsub.message" = "你已解锁终身会员。已有的订阅不会自动取消——请关闭自动续费，避免被重复扣费。";
+"sub.lifetime.cancelsub.action" = "去取消订阅";
+"sub.lifetime.cancelsub.later" = "稍后";
 
 /* --- 通用 & 法律 --- */
 "sub.restore" = "恢复购买";

@@ -8,9 +8,63 @@
 import SwiftUI
 import StoreKit
 import Combine
+import Security
 
 enum TimeoutError: Error {
     case operationTimeout
+}
+
+// MARK: - Lifetime cache (Keychain, device-bound)
+/// Caches the lifetime (non-consumable) unlock in the device Keychain so the
+/// membership survives an Apple ID switch on the SAME device. The flag is
+/// cleared automatically when StoreKit reports the purchase was refunded
+/// (revocationDate != nil). Keychain is used (not UserDefaults) so the flag
+/// persists across app reinstalls but never syncs to a different device.
+enum LifetimeCache {
+    private static let service = "com.claire.tastytidy.iap"
+    private static let account = "lifetime_unlocked"
+
+    static var isUnlocked: Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        return value == "1"
+    }
+
+    static func set(_ unlocked: Bool) {
+        if unlocked {
+            let data = Data("1".utf8)
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account
+            ]
+            // Delete any existing item, then add fresh.
+            SecItemDelete(query as CFDictionary)
+            var attributes = query
+            attributes[kSecValueData as String] = data
+            attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            SecItemAdd(attributes as CFDictionary, nil)
+        } else {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account
+            ]
+            SecItemDelete(query as CFDictionary)
+        }
+    }
 }
 
 @MainActor
@@ -35,14 +89,27 @@ final class StoreManager: ObservableObject {
     @Published var productLoadFailed: Bool = false
 
     // ✅ Product IDs
-    private let productIDs: [String] = [
+    private let lifetimeID = "com.claire.tastytidy.forever"
+    private let subscriptionIDs: [String] = [
         "com.claire.tastytidy.month",
         "com.claire.tastytidy.quarter",
         "com.claire.tastytidy.year"
     ]
+    private var productIDs: [String] { subscriptionIDs + [lifetimeID] }
+
+    /// Whether the user owns the lifetime unlock — true if StoreKit reports the
+    /// non-consumable on the current Apple ID, OR the device Keychain cached it
+    /// (covers the case where the user switched to a different Apple ID).
+    @Published private(set) var hasLifetime: Bool = false
 
     // Convenience
-    var hasUnlockedPremium: Bool { displayStatus.isPremium }
+    var hasUnlockedPremium: Bool { hasLifetime || displayStatus.isPremium }
+
+    /// Whether an auto-renewable subscription is currently active. Used to warn
+    /// the user to cancel it after buying lifetime (avoids double charging).
+    var hasActiveSubscription: Bool {
+        subscriptionIDs.contains { purchasedIDs.contains($0) }
+    }
 
     var currentSubscription: Product? {
         // If multiple entitlements exist, prefer longer duration
@@ -158,7 +225,9 @@ final class StoreManager: ObservableObject {
             newPurchased.insert(transaction.productID)
 
             // Type
-            if transaction.productID == "com.claire.tastytidy.year" {
+            if transaction.productID == lifetimeID {
+                subscriptionType = .lifetime
+            } else if transaction.productID == "com.claire.tastytidy.year" {
                 subscriptionType = .yearly
             } else if transaction.productID == "com.claire.tastytidy.quarter" {
                 subscriptionType = .quarterly
@@ -166,7 +235,7 @@ final class StoreManager: ObservableObject {
                 subscriptionType = .monthly
             }
 
-            // Expiration date
+            // Expiration date (subscriptions only — lifetime has none)
             if let exp = transaction.expirationDate {
                 if latestExpirationDate == nil || exp > latestExpirationDate! {
                     latestExpirationDate = exp
@@ -183,12 +252,44 @@ final class StoreManager: ObservableObject {
             }
         }
 
+        // MARK: Lifetime resolution (StoreKit truth + Keychain fallback)
+        //
+        // `Transaction.latest(for:)` returns the latest transaction for THIS
+        // Apple ID, including refunded ones. Three cases:
+        //   • valid (revocationDate == nil)  → owns it, refresh Keychain cache
+        //   • refunded (revocationDate != nil) → clear cache, lose access
+        //   • nil (this Apple ID never bought) → trust the Keychain cache
+        //     (this is the "switched Apple ID" case we want to survive)
+        var ownsLifetime = false
+        if let latest = await Transaction.latest(for: lifetimeID),
+           let txn = try? checkVerified(latest) {
+            if txn.revocationDate == nil {
+                ownsLifetime = true
+                LifetimeCache.set(true)        // refresh device cache
+            } else {
+                ownsLifetime = false
+                LifetimeCache.set(false)       // refunded → revoke locally too
+                newPurchased.remove(lifetimeID)
+            }
+        } else {
+            // Current Apple ID has no record — fall back to the device cache.
+            ownsLifetime = LifetimeCache.isUnlocked
+        }
+
+        if ownsLifetime {
+            newPurchased.insert(lifetimeID)
+            if subscriptionType == .none { subscriptionType = .lifetime }
+        }
+
+        hasLifetime = ownsLifetime
         purchasedIDs = newPurchased
         nextRenewalDate = latestExpirationDate
         currentSubscriptionType = subscriptionType
 
-        // Display status
-        if let exp = latestExpirationDate {
+        // Display status — lifetime takes precedence (no renewal date).
+        if ownsLifetime {
+            displayStatus = .active(renewDate: nil)
+        } else if let exp = latestExpirationDate {
             if foundIntroTrial {
                 displayStatus = .trial(daysLeft: trialDaysLeft ?? 0, renewDate: exp)
             } else {
@@ -268,6 +369,7 @@ enum SubscriptionType {
     case monthly
     case quarterly
     case yearly
+    case lifetime
 
     var displayName: String {
         switch self {
@@ -275,6 +377,7 @@ enum SubscriptionType {
         case .monthly: return String(localized: "sub.type.monthly", defaultValue: "Monthly")
         case .quarterly: return String(localized: "sub.type.quarterly", defaultValue: "Quarterly")
         case .yearly: return String(localized: "sub.type.yearly", defaultValue: "Yearly")
+        case .lifetime: return String(localized: "sub.type.lifetime", defaultValue: "Lifetime")
         }
     }
 }

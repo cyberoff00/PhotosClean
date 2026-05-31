@@ -15,17 +15,23 @@ struct SubscriptionView: View {
     @State private var isRestoring = false
     @State private var selectedProductID: String?
     @State private var hasInitialized = false
+    @State private var showCancelSubAlert = false
 
     // MARK: - Product sorting
     private func sortProducts(_ products: [Product]) -> [Product] {
         func rank(_ p: Product) -> Int {
+            if p.type == .nonConsumable { return 0 }                    // Lifetime first
             guard let period = p.subscription?.subscriptionPeriod else { return 99 }
-            if period.unit == .year && period.value == 1 { return 0 }   // Yearly first
-            if period.unit == .month && period.value == 3 { return 1 }  // Quarterly
-            if period.unit == .month && period.value == 1 { return 2 }  // Monthly
+            if period.unit == .year && period.value == 1 { return 1 }   // Yearly
+            if period.unit == .month && period.value == 3 { return 2 }  // Quarterly
+            if period.unit == .month && period.value == 1 { return 3 }  // Monthly
             return 99
         }
         return products.sorted { rank($0) < rank($1) }
+    }
+
+    private func isLifetime(_ product: Product) -> Bool {
+        product.type == .nonConsumable
     }
 
     private var products: [Product] {
@@ -93,6 +99,19 @@ struct SubscriptionView: View {
                 await storeManager.updatePurchasedProducts()
             }
         }
+        .alert("sub.lifetime.cancelsub.title", isPresented: $showCancelSubAlert) {
+            Button("sub.lifetime.cancelsub.action") {
+                Task {
+                    await openManageSubscriptions()
+                    dismiss()
+                }
+            }
+            Button("sub.lifetime.cancelsub.later", role: .cancel) {
+                dismiss()
+            }
+        } message: {
+            Text("sub.lifetime.cancelsub.message")
+        }
     }
 
     // MARK: - Subscribed content
@@ -116,7 +135,11 @@ struct SubscriptionView: View {
             }
             .padding(.vertical, 6)
 
-            if let current = storeManager.currentSubscription {
+            if storeManager.hasLifetime {
+                Text("sub.type.lifetime")
+                    .font(.caption.bold())
+                    .foregroundColor(.orange)
+            } else if let current = storeManager.currentSubscription {
                 Text("sub.current.plan".localized(with: current.displayName, current.displayPrice))
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -124,19 +147,22 @@ struct SubscriptionView: View {
 
             Spacer()
 
-            // Manage subscription
-            Button {
-                Task {
-                    await openManageSubscriptions()
+            // Manage subscription — only relevant when an auto-renewable
+            // subscription is actually active (lifetime has nothing to manage).
+            if storeManager.hasActiveSubscription {
+                Button {
+                    Task {
+                        await openManageSubscriptions()
+                    }
+                } label: {
+                    Text("sub.manage.subscription")
+                        .bold()
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(Color(.secondarySystemBackground))
+                        .foregroundColor(.orange)
+                        .cornerRadius(16)
                 }
-            } label: {
-                Text("sub.manage.subscription")
-                    .bold()
-                    .frame(maxWidth: .infinity)
-                    .padding()
-                    .background(Color(.secondarySystemBackground))
-                    .foregroundColor(.orange)
-                    .cornerRadius(16)
             }
 
             bottomLegalLinks
@@ -224,7 +250,15 @@ struct SubscriptionView: View {
                     Task {
                         do {
                             try await storeManager.buy(product)
-                            if storeManager.hasUnlockedPremium { dismiss() }
+                            guard storeManager.hasUnlockedPremium else { return }
+                            // If the user just bought lifetime but still has an
+                            // active auto-renewable subscription, prompt them to
+                            // cancel it so they aren't charged twice.
+                            if isLifetime(product) && storeManager.hasActiveSubscription {
+                                showCancelSubAlert = true
+                            } else {
+                                dismiss()
+                            }
                         } catch {
                             print("Purchase failed: \(error)")
                         }
@@ -306,6 +340,9 @@ struct SubscriptionView: View {
 
     // MARK: - Copy helpers
     private func planTitleKey(for product: Product) -> LocalizedStringKey {
+        if isLifetime(product) {
+            return "sub.plan.lifetime.title"
+        }
         if let period = product.subscription?.subscriptionPeriod,
            period.unit == .year, period.value == 1 {
             return "sub.plan.yearly.title"
@@ -322,6 +359,10 @@ struct SubscriptionView: View {
     }
 
     private func planSubtitle(for product: Product) -> String {
+        if isLifetime(product) {
+            return String(localized: "sub.plan.lifetime.subtitle", defaultValue: "%@ · one-time")
+                .replacingOccurrences(of: "%@", with: product.displayPrice)
+        }
         if let period = product.subscription?.subscriptionPeriod {
             if period.unit == .year && period.value == 1 {
                 return String(localized: "sub.plan.yearly.subtitle", defaultValue: "%@ / year")
@@ -339,10 +380,10 @@ struct SubscriptionView: View {
         return product.displayPrice
     }
 
-    /// Badge priority: Best Value (yearly) > Trial
+    /// Lifetime is the headline "Best Value"; any subscription carrying a
+    /// free-trial intro offer (the yearly plan) shows the trial badge.
     private func badgeText(for product: Product) -> String? {
-        if let period = product.subscription?.subscriptionPeriod,
-           period.unit == .year, period.value == 1 {
+        if isLifetime(product) {
             return String(localized: "sub.badge.bestvalue", defaultValue: "Best Value")
         }
 
@@ -354,6 +395,9 @@ struct SubscriptionView: View {
     }
 
     private func primaryCTA(for product: Product) -> String {
+        if isLifetime(product) {
+            return String(localized: "sub.cta.lifetime", defaultValue: "Buy Lifetime")
+        }
         if badgeText(for: product) == String(localized: "sub.badge.trial7", defaultValue: "7-day free trial") {
             return String(localized: "sub.cta.trial7", defaultValue: "Start free trial")
         }
@@ -361,6 +405,9 @@ struct SubscriptionView: View {
     }
 
     private func secondaryCTA(for product: Product) -> String {
+        if isLifetime(product) {
+            return String(localized: "sub.cta.lifetime.detail", defaultValue: "Pay once, keep forever")
+        }
         if let period = product.subscription?.subscriptionPeriod {
             if period.unit == .year && period.value == 1 {
                 return String(localized: "sub.cta.then.yearly", defaultValue: "Then %@ / year")
