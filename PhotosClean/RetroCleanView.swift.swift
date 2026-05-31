@@ -35,6 +35,14 @@ struct RetroCleanView: View {
     // Live / Video
     @State private var livePhoto: PHLivePhoto?
     @State private var isPlayingLivePhoto = false
+    @State private var livePhotoAssetID: String?
+    @State private var livePhotoPreloadID: PHImageRequestID = PHInvalidImageRequestID
+    @State private var isLoadingLivePhoto = false
+    @State private var pendingLivePlay = false
+    @State private var livePhotoCache: [String: PHLivePhoto] = [:]
+    @State private var liveWarmInFlight: Set<String> = []
+    private static let liveWarmAhead = 2
+    private static let liveCacheCap = 5
     @State private var player: AVPlayer?
     @State private var isMuted = true
     @State private var currentVideoAssetID: String? = nil
@@ -299,7 +307,7 @@ struct RetroCleanView: View {
                             displayImage: card.image,
                             livePhoto: $livePhoto,
                             isPlayingLivePhoto: $isPlayingLivePhoto,
-                            isLoadingLivePhoto: false,
+                            isLoadingLivePhoto: isLoadingLivePhoto,
                             zoomScale: $imageScale,
                             zoomResetToken: zoomResetToken,
                             player: $player,
@@ -334,7 +342,13 @@ struct RetroCleanView: View {
                     .zIndex(Double(stackDisplayCount - idx))
                     .allowsHitTesting(isTop && !isAnimatingOut)
                     .overlay(isTop ? swipeHintOverlay : nil)
-                    .highPriorityGesture(cardGesture(), including: (isTop && !isZooming) ? .all : .subviews)
+                    // Only attach the drag recognizer to the top card. Attaching it
+                    // to every stacked card creates gesture state per card and
+                    // re-installs recognizers on each swipe — the source of jank.
+                    .highPriorityGesture(
+                        isTop ? cardGesture() : nil,
+                        including: (isTop && !isZooming) ? .all : .subviews
+                    )
             }
         }
     }
@@ -447,6 +461,12 @@ struct RetroCleanView: View {
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
             self.undoStack.append(assetID)
+
+            // Cancel the swiped card's in-flight (esp. iCloud) download so it stops
+            // competing with the next card's fetch.
+            if let reqID = self.cardImageRequestIDs.removeValue(forKey: assetID) {
+                self.imageManager.cancelImageRequest(reqID)
+            }
 
             self.upsertTag(assetID: assetID) { tag in
                 tag.status = status
@@ -569,7 +589,7 @@ struct RetroCleanView: View {
 
     var bottomButtons: some View {
         HStack(spacing: 40) {
-            ActionButton(icon: "trash.fill", color: .red) {
+            ActionButton(icon: "trash.fill", color: .gray) {
                 triggerButtonSwipe(status: "delete")
             }
             ActionButton(icon: "clock.fill", color: .yellow) {
@@ -623,6 +643,8 @@ struct RetroCleanView: View {
             cancelPendingImageRequests()
             buffer.removeAll()
             loadingIDs.removeAll()
+            livePhotoCache.removeAll()
+            liveWarmInFlight.removeAll()
             activeCard = nil
             settleOffset = .zero
             isAnimatingOut = false
@@ -637,9 +659,19 @@ struct RetroCleanView: View {
 
         cardImageRequestIDs[id] = loadCardState(for: currentAsset) { card in
             DispatchQueue.main.async {
-                self.cardImageRequestIDs.removeValue(forKey: id)
                 self.loadingIDs.remove(id)
                 guard revision == self.sourceRevision else { return }
+
+                // The user may have swiped away during the degraded→full load window.
+                // Only adopt this card as active if it's still the current one;
+                // otherwise upgrade it in the buffer (if still in range) or drop it,
+                // so a late delivery can't resurrect a dismissed card.
+                guard self.currentAssetID == id else {
+                    if let idx = self.buffer.firstIndex(where: { $0.asset.localIdentifier == id }) {
+                        self.buffer[idx] = card
+                    }
+                    return
+                }
 
                 self.buffer.removeAll(where: { $0.asset.localIdentifier == id })
                 self.buffer.insert(card, at: 0)
@@ -809,42 +841,118 @@ struct RetroCleanView: View {
         guard let asset = activeCard?.asset,
               asset.mediaSubtypes.contains(.photoLive) else { return }
 
+        // Tapped again while a slow (iCloud) load is in progress — cancel it.
+        if isLoadingLivePhoto {
+            isLoadingLivePhoto = false
+            pendingLivePlay = false
+            return
+        }
         if isPlayingLivePhoto {
             isPlayingLivePhoto = false
             return
         }
+        // Preloaded and warm → instant play.
+        if livePhoto != nil, livePhotoAssetID == asset.localIdentifier {
+            isPlayingLivePhoto = true
+            return
+        }
+        // Not ready yet (historical iCloud Live Photo still downloading): show a
+        // spinner and auto-play the moment the background load finishes.
+        pendingLivePlay = true
+        isLoadingLivePhoto = true
+        preloadLivePhoto(for: asset)
+    }
+
+    /// Load the Live Photo as soon as the card appears so a tap plays instantly.
+    private func preloadLivePhoto(for asset: PHAsset) {
+        let assetID = asset.localIdentifier
+        guard livePhotoAssetID != assetID else { return }
+
+        if let cached = livePhotoCache[assetID] {
+            livePhoto = cached
+            livePhotoAssetID = assetID
+            return
+        }
+
+        if livePhotoPreloadID != PHInvalidImageRequestID {
+            PHImageManager.default().cancelImageRequest(livePhotoPreloadID)
+            livePhotoPreloadID = PHInvalidImageRequestID
+        }
 
         let opt = PHLivePhotoRequestOptions()
         opt.isNetworkAccessAllowed = true
-        opt.deliveryMode = .opportunistic
-
+        opt.deliveryMode = .highQualityFormat
         let scale = UIScreen.main.scale
-        let targetSize = CGSize(width: UIScreen.main.bounds.width * scale,
-                                height: UIScreen.main.bounds.height * scale)
+        let target = CGSize(width: cardWidth * scale, height: cardHeight * scale)
 
-        PHImageManager.default().requestLivePhoto(
-            for: asset,
-            targetSize: targetSize,
-            contentMode: .aspectFit,
-            options: opt
-        ) { live, info in
+        livePhotoPreloadID = PHImageManager.default().requestLivePhoto(
+            for: asset, targetSize: target, contentMode: .aspectFit, options: opt
+        ) { live, _ in
             guard let live else { return }
-
-            if let degraded = info?[PHLivePhotoInfoIsDegradedKey] as? Bool, degraded {
-                return
-            }
-
             DispatchQueue.main.async {
+                self.cacheLivePhoto(live, for: assetID)
+                guard self.activeCard?.asset.localIdentifier == assetID else { return }
                 self.livePhoto = live
-                self.isPlayingLivePhoto = true
+                self.livePhotoAssetID = assetID
+                if self.pendingLivePlay {
+                    self.pendingLivePlay = false
+                    self.isLoadingLivePhoto = false
+                    self.isPlayingLivePhoto = true
+                }
             }
+        }
+    }
+
+    /// Pre-download Live Photos for the next cards so they're instant on arrival.
+    private func warmUpcomingLivePhotos() {
+        let upcoming = buffer.prefix(6).map(\.asset)
+            .filter { $0.mediaSubtypes.contains(.photoLive) }
+        var warmed = 0
+        for asset in upcoming {
+            if warmed >= Self.liveWarmAhead { break }
+            warmed += 1
+            let id = asset.localIdentifier
+            if livePhotoCache[id] != nil || liveWarmInFlight.contains(id) { continue }
+            liveWarmInFlight.insert(id)
+
+            let opt = PHLivePhotoRequestOptions()
+            opt.isNetworkAccessAllowed = true
+            opt.deliveryMode = .highQualityFormat
+            let scale = UIScreen.main.scale
+            let target = CGSize(width: cardWidth * scale, height: cardHeight * scale)
+
+            PHImageManager.default().requestLivePhoto(
+                for: asset, targetSize: target, contentMode: .aspectFit, options: opt
+            ) { live, _ in
+                DispatchQueue.main.async {
+                    self.liveWarmInFlight.remove(id)
+                    guard let live else { return }
+                    self.cacheLivePhoto(live, for: id)
+                }
+            }
+        }
+    }
+
+    private func cacheLivePhoto(_ live: PHLivePhoto, for id: String) {
+        livePhotoCache[id] = live
+        guard livePhotoCache.count > Self.liveCacheCap else { return }
+        let keep = Set([activeCard?.asset.localIdentifier].compactMap { $0 }
+                       + buffer.map(\.asset.localIdentifier))
+        for k in livePhotoCache.keys where !keep.contains(k) {
+            livePhotoCache.removeValue(forKey: k)
+            if livePhotoCache.count <= Self.liveCacheCap { break }
         }
     }
 
     // MARK: - Video
     private func prepareMediaForCurrent() {
         guard let asset = activeCard?.asset else { return }
-        if asset.mediaType == .video { loadVideo(for: asset) }
+        if asset.mediaType == .video {
+            loadVideo(for: asset)
+        } else if asset.mediaSubtypes.contains(.photoLive) {
+            preloadLivePhoto(for: asset)
+        }
+        warmUpcomingLivePhotos()
     }
 
     func loadVideo(for asset: PHAsset) {
@@ -992,6 +1100,10 @@ struct RetroCleanView: View {
     private func stopAllMedia() {
         AudioSessionManager.endVideoAudio()
         cancelCurrentVideoRequests()
+        if livePhotoPreloadID != PHInvalidImageRequestID {
+            PHImageManager.default().cancelImageRequest(livePhotoPreloadID)
+            livePhotoPreloadID = PHInvalidImageRequestID
+        }
         player?.pause()
         player = nil
         currentVideoAssetID = nil
@@ -999,6 +1111,9 @@ struct RetroCleanView: View {
 
         isPlayingLivePhoto = false
         livePhoto = nil
+        livePhotoAssetID = nil
+        isLoadingLivePhoto = false
+        pendingLivePlay = false
 
         isMuted = true
 
