@@ -145,6 +145,13 @@
 "sub.manage.subscription" = "管理订阅";
 "sub.change.plan" = "更改方案";
 
+// 切换方案 / 升级（向活跃订阅用户展示）
+"sub.manage.subtitle" = "可随时切换方案或升级为终身版。";
+"sub.badge.current" = "当前";
+"sub.cta.current" = "当前方案";
+"sub.cta.switch" = "切换到此方案";
+"sub.cta.lifetime.upgrade" = "升级为终身版";
+
 // 买断后仍有活跃订阅时的提示
 "sub.lifetime.cancelsub.title" = "请取消你的订阅";
 "sub.lifetime.cancelsub.message" = "你已解锁终身会员。已有的订阅不会自动取消——请关闭自动续费，避免被重复扣费。";
@@ -235,7 +242,7 @@
 
 /* Daily Quota Upgrade Card */
 "quota.title" = "今日免费额度已用完";
-"quota.subtitle" = "每天可以免费整理 20 张照片\n升级后不再有数量限制";
+"quota.subtitle" = "每天可以免费整理 36 张照片\n升级后不再有数量限制";
 "quota.indie" = "一个人开发的小工具\n你的支持是最大的动力 ☺️";
 
 "quota.cta" = "了解 Premium";
@@ -259,6 +266,8 @@
 "cleanup.auth.title" = "需要相册权限";
 "cleanup.auth.message" = "要删除照片，请在设置中允许完整的相册访问权限。";
 "cleanup.auth.settings" = "打开设置";
+"cleanup.auth.restricted.title" = "相册访问受限";
+"cleanup.auth.restricted.message" = "相册访问被「屏幕使用时间」的访问限制关闭了。请前往 设置 → 屏幕使用时间 → 内容和隐私访问限制 → 照片，改为「允许更改」后再试。";
 
 /* 评分门 */
 "rating.ask.title" = "喜欢 TastyTidy 吗？";

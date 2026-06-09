@@ -234,6 +234,15 @@ enum PhotoLibraryAuth {
         PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
     }
 
+    /// True when Photos access is blocked by Screen Time / MDM "Content & Privacy
+    /// Restrictions". In this state iOS hides the per-app Photos toggle from
+    /// Settings entirely, so sending the user to the app's settings page is
+    /// useless — they must lift the restriction in Screen Time → Content &
+    /// Privacy Restrictions → Photos instead.
+    static var isRestricted: Bool {
+        PHPhotoLibrary.authorizationStatus(for: .readWrite) == .restricted
+    }
+
     /// Requests .readWrite access. Returns true only when the user grants full access.
     /// `.limited` returns false because deleteAssets is not honored under limited access.
     static func requestWriteAccess(_ completion: @escaping (Bool) -> Void) {
@@ -253,5 +262,78 @@ enum PhotoLibraryAuth {
     static func openSettings() {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
         UIApplication.shared.open(url)
+    }
+}
+
+// MARK: - ForegroundGate
+/// Gates work until the UI can actually present a system dialog.
+///
+/// PHAssetChangeRequest.deleteAssets makes iOS present its OWN "Delete N Photos?"
+/// confirmation — we don't present it, the system does, on the active scene's key
+/// window. UIKit silently drops that presentation in two situations:
+///   1. The scene isn't foreground-active (the beat right after a permission
+///      prompt dismisses, or the app was backgrounded during our async fetch) —
+///      iOS then holds/drops the confirmation, which is how users get "nothing
+///      happened" followed by a pile of dialogs on the next launch.
+///   2. Another presentation is mid-transition — a Menu collapsing or an alert/
+///      sheet animating away. Firing performChanges into that window makes UIKit
+///      refuse the confirmation, so it never appears and the completion never runs.
+///
+/// runWhenReady waits out both: it fires only once the app is active AND nothing
+/// is mid-transition. Must be called on the main thread.
+enum ForegroundGate {
+    /// Key window of the foreground-active scene.
+    private static var keyWindow: UIWindow? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }?
+            .windows.first { $0.isKeyWindow }
+    }
+
+    /// True while any controller in the presentation chain is being presented or
+    /// dismissed (Menu collapsing, alert/sheet appearing or going away).
+    private static var isPresentationSettling: Bool {
+        guard var vc = keyWindow?.rootViewController else { return false }
+        while true {
+            if vc.isBeingPresented || vc.isBeingDismissed { return true }
+            guard let next = vc.presentedViewController else { return false }
+            vc = next
+        }
+    }
+
+    /// Runs `block` once the app is foreground-active and no presentation
+    /// transition is in flight, retrying frame by frame until ready (capped at
+    /// ~3s). If it never settles in time, falls back to firing on the next
+    /// activation so the work is deferred rather than dropped.
+    static func runWhenReady(_ block: @escaping () -> Void, remainingFrames: Int = 180) {
+        if UIApplication.shared.applicationState == .active && !isPresentationSettling {
+            block()
+            return
+        }
+        guard remainingFrames > 0 else {
+            runWhenActive(block)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) {
+            runWhenReady(block, remainingFrames: remainingFrames - 1)
+        }
+    }
+
+    /// Runs `block` immediately if foreground-active, otherwise exactly once the
+    /// next time the app becomes active.
+    static func runWhenActive(_ block: @escaping () -> Void) {
+        if UIApplication.shared.applicationState == .active {
+            block()
+            return
+        }
+        var token: NSObjectProtocol?
+        token = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            if let token { NotificationCenter.default.removeObserver(token) }
+            block()
+        }
     }
 }

@@ -13,7 +13,7 @@ final class PaywallGate: ObservableObject {
     @Published var showPaywall: Bool = false
 
     /// Daily free quota for non-premium users
-    let dailyFreeLimit: Int = 20
+    let dailyFreeLimit: Int = 36
 
     // Persistent storage
     @AppStorage("daily_swipes_used") private var used: Int = 0

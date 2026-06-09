@@ -41,8 +41,11 @@ struct PhotoGridView: View {
     @State private var searchText = ""
     // searchText 经过 ~250ms debounce 后写入这里；过滤热路径只跟它走。
     @State private var debouncedSearchText = ""
-    @State private var showingDeleteConfirm = false
     @State private var showingPhotoAuthAlert = false
+    /// True while a library delete is in flight. Blocks repeated taps from
+    /// enqueuing multiple PHPhotoLibrary delete requests whose system
+    /// confirmation dialogs would otherwise stack up and flush on next launch.
+    @State private var isDeletingPhotos = false
     @State private var cachedYearsMonths: [String] = []
     // 预计算 assetID → (year, month)。loadPhotos 时一次构建，避免在 filter 热路径里
     // 反复调 Calendar.dateComponents（ICU 很慢）。
@@ -74,7 +77,6 @@ struct PhotoGridView: View {
     // ✅ 多选（像相册一样顺次一滑多选）
     @State private var isSelectionMode = false
     @State private var selectedIDs: Set<String> = []
-    @State private var showingDeleteSelectedConfirm = false
 
     // ✅ Batch add note (append with semicolons; keep existing notes)
     @State private var showingBatchNoteSheet = false
@@ -119,14 +121,6 @@ struct PhotoGridView: View {
             .navigationTitle(title)
             .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always))
             .toolbar { trailingToolbar }
-            .alert("grid.deleteConfirm".localized, isPresented: $showingDeleteConfirm) {
-                Button("grid.cancel".localized, role: .cancel) {}
-                Button("grid.deleteAll".localized, role: .destructive) { deleteMarkedPhotos() }
-            }
-            .alert("grid.deleteSelectedConfirm".localized, isPresented: $showingDeleteSelectedConfirm) {
-                Button("grid.cancel".localized, role: .cancel) {}
-                Button("grid.deleteSelected".localized, role: .destructive) { deleteSelectedPhotos() }
-            }
             .alert("grid.photoAuth.title".localized, isPresented: $showingPhotoAuthAlert) {
                 Button("grid.cancel".localized, role: .cancel) {}
                 Button("grid.photoAuth.openSettings".localized) { PhotoLibraryAuth.openSettings() }
@@ -309,7 +303,9 @@ struct PhotoGridView: View {
                     }
                     .disabled(selectedIDs.isEmpty)
                     Button(role: .destructive) {
-                        showingDeleteSelectedConfirm = true
+                        // iOS's own delete confirmation is the gate here; no
+                        // redundant app-level alert.
+                        deleteSelectedPhotos()
                     } label: {
                         Label("grid.deleteSelected".localized + " (\(selectedIDs.count))", systemImage: "trash.fill")
                     }
@@ -415,7 +411,11 @@ struct PhotoGridView: View {
         let sizeLabel = deleteCount > 0 ? " · \(approxPrefix)\(pendingBytes.byteCountShort)" : ""
         return Menu {
             Button(role: .destructive) {
-                showingDeleteConfirm = true
+                // No app-level confirm: iOS presents its own "Delete N Photos?"
+                // confirmation (which we can't suppress), so a second one would
+                // just be a redundant tap. ForegroundGate waits for this menu to
+                // finish collapsing before the system dialog is presented.
+                deleteMarkedPhotos()
             } label: {
                 Label("grid.deleteAll".localized + " (\(deleteCount))" + sizeLabel, systemImage: "trash.fill")
             }
@@ -839,9 +839,13 @@ struct PhotoGridView: View {
     }
 
     func deleteMarkedPhotos() {
+        guard !isDeletingPhotos else { return }
         let deleteIDs = allTags.filter { $0.status == "delete" }.map { $0.assetID }
+        guard !deleteIDs.isEmpty else { return }
+        isDeletingPhotos = true
         PhotoLibraryAuth.requestWriteAccess { granted in
             guard granted else {
+                isDeletingPhotos = false
                 showingPhotoAuthAlert = true
                 return
             }
@@ -850,9 +854,13 @@ struct PhotoGridView: View {
     }
 
     func deleteSelectedPhotos() {
+        guard !isDeletingPhotos else { return }
         let ids = Array(selectedIDs)
+        guard !ids.isEmpty else { return }
+        isDeletingPhotos = true
         PhotoLibraryAuth.requestWriteAccess { granted in
             guard granted else {
+                isDeletingPhotos = false
                 showingPhotoAuthAlert = true
                 return
             }
@@ -870,31 +878,37 @@ struct PhotoGridView: View {
 
             // StorageStats 是 @MainActor，size lookup 在主线程做（dict 查表，毫秒级）。
             DispatchQueue.main.async {
-                let bytes = storageStats.totalBestSize(for: array)
-                PHPhotoLibrary.shared().performChanges({
-                    PHAssetChangeRequest.deleteAssets(result)
-                }) { success, _ in
-                    DispatchQueue.main.async {
-                        // success=false 一般意味着用户在系统弹窗里取消了删除确认。
-                        guard success else { return }
-                        let idSet = Set(ids)
+                // 删除确认是 iOS 弹的，只有「前台活跃 + 当前没有弹层在做出现/消失
+                // 过渡」时才呈现得了。菜单收起、alert 消失、或场景非活跃的瞬间去调，
+                // UIKit 会丢掉系统框（什么都不弹）或压栈到下次启动。等到可呈现再弹。
+                ForegroundGate.runWhenReady {
+                    let bytes = storageStats.totalBestSize(for: array)
+                    PHPhotoLibrary.shared().performChanges({
+                        PHAssetChangeRequest.deleteAssets(result)
+                    }) { success, _ in
+                        DispatchQueue.main.async {
+                            isDeletingPhotos = false
+                            // success=false 一般意味着用户在系统弹窗里取消了删除确认。
+                            guard success else { return }
+                            let idSet = Set(ids)
 
-                        // 1) 立刻把已删除的 asset 从 snapshot 移除，UI 立即反映；
-                        //    避免再调一次 loadPhotos() 全库重抓 + 重建年月字典（几万张时秒级）。
-                        allAssetsSnapshot.removeAll { idSet.contains($0.localIdentifier) }
+                            // 1) 立刻把已删除的 asset 从 snapshot 移除，UI 立即反映；
+                            //    避免再调一次 loadPhotos() 全库重抓 + 重建年月字典（几万张时秒级）。
+                            allAssetsSnapshot.removeAll { idSet.contains($0.localIdentifier) }
 
-                        // 2) 标签删除用 Set 一遍过，O(n+m) 替代 O(n×m) 线性扫描。
-                        for tag in allTags where idSet.contains(tag.assetID) {
-                            modelContext.delete(tag)
+                            // 2) 标签删除用 Set 一遍过，O(n+m) 替代 O(n×m) 线性扫描。
+                            for tag in allTags where idSet.contains(tag.assetID) {
+                                modelContext.delete(tag)
+                            }
+                            try? modelContext.save()
+                            // save 触发 @Query 重发 → onChange(of: allTags) 会用最新的
+                            // allAssetsSnapshot + statusByAssetID 重新过滤，结果正确。
+
+                            storageStats.recordCleanup(bytes: bytes)
+                            ratingPrompt.registerCleanup()
+                            WidgetCenter.shared.reloadAllTimelines()
+                            if exitSelection { exitSelectionMode() }
                         }
-                        try? modelContext.save()
-                        // save 触发 @Query 重发 → onChange(of: allTags) 会用最新的
-                        // allAssetsSnapshot + statusByAssetID 重新过滤，结果正确。
-
-                        storageStats.recordCleanup(bytes: bytes)
-                        ratingPrompt.registerCleanup()
-                        WidgetCenter.shared.reloadAllTimelines()
-                        if exitSelection { exitSelectionMode() }
                     }
                 }
             }

@@ -157,6 +157,13 @@
 // Action buttons
 "sub.manage.subscription" = "Manage Subscription";
 
+// Switch plan / upgrade (shown to active subscribers)
+"sub.manage.subtitle" = "Switch your plan or upgrade to Lifetime anytime.";
+"sub.badge.current" = "Current";
+"sub.cta.current" = "Current plan";
+"sub.cta.switch" = "Switch to this plan";
+"sub.cta.lifetime.upgrade" = "Upgrade to Lifetime";
+
 // Prompt shown after buying Lifetime while a subscription is still active
 "sub.lifetime.cancelsub.title" = "Cancel your subscription";
 "sub.lifetime.cancelsub.message" = "You now have lifetime access. Your existing subscription won't cancel automatically — please turn off auto-renew so you aren't charged again.";
@@ -251,7 +258,7 @@
 
 /* Daily Quota Upgrade Card */
 "quota.title" = "Daily free limit reached";
-"quota.subtitle" = "You can sort 20 photos for free each day.\nUpgrade for unlimited sorting.";
+"quota.subtitle" = "You can sort 36 photos for free each day.\nUpgrade for unlimited sorting.";
 "quota.indie" = "Built by a solo developer.\nYour support means the world.";
 
 "quota.cta" = "Learn about Premium";
@@ -275,6 +282,8 @@
 "cleanup.auth.title" = "Photos Access Needed";
 "cleanup.auth.message" = "To delete photos, allow full Photos access in Settings.";
 "cleanup.auth.settings" = "Open Settings";
+"cleanup.auth.restricted.title" = "Photos Access Restricted";
+"cleanup.auth.restricted.message" = "Photos access is turned off by Screen Time restrictions. Go to Settings → Screen Time → Content & Privacy Restrictions → Photos and allow changes, then try again.";
 
 /* Rating gate */
 "rating.ask.title" = "Enjoying TastyTidy?";

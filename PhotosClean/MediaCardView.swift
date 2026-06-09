@@ -90,7 +90,17 @@ struct MediaCardView: View {
             // to prepare; keep it invisible until playing. Tapping then plays
             // instantly instead of stalling on a freshly-created view.
             if let live = livePhoto {
+                // Constrain + clip the Live Photo view to the card. The earlier
+                // `.clipped()` only clips the still image *above* this overlay in
+                // the chain, NOT the overlay itself — so without an explicit
+                // frame/clip here, iOS 18's `.full` PHLivePhotoView playback
+                // renders past the card bounds and balloons to full screen. That
+                // overflow also pushed the play area outside the card's gesture
+                // frame, which is why swiping stopped working while it played.
                 LivePhotoView(livePhoto: live, isPlaying: $isPlayingLivePhoto)
+                    .padding(12)
+                    .frame(width: cardWidth, height: cardHeight)
+                    .clipped()
                     .opacity(isPlayingLivePhoto ? 1 : 0)
                     .allowsHitTesting(false)
             }

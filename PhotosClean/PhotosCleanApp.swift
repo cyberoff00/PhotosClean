@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 import Photos
 import WidgetKit
+import RevenueCat
 
 @main
 struct PhotosCleanApp: App {
@@ -50,6 +51,13 @@ struct PhotosCleanApp: App {
     }()
 
     init() {
+        // Configure RevenueCat FIRST — must run before any StoreManager /
+        // Purchases.shared access. (@StateObject is created lazily when the
+        // scene's body is first evaluated, i.e. after this init, so this is
+        // guaranteed to run first.)
+        Purchases.logLevel = .error
+        Purchases.configure(withAPIKey: "appl_EAMUZfYdOxhWkFPIQBureXUHvvV")
+
         // 启动相册监听器
         _ = PhotoLibraryObserver.shared
         // 首次启动主动请求 .readWrite 权限；否则系统默认只授予 .addOnly，

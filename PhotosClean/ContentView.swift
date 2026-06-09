@@ -73,6 +73,13 @@ struct ContentView: View {
     // MARK: Header counts cache（避免 body 里每帧 filter allTags）
     @State private var redCount: Int = 0
     @State private var showCleanupAuthAlert = false
+    // Photos access blocked by Screen Time / MDM restrictions — needs its own
+    // message because the per-app Settings toggle doesn't exist in this case.
+    @State private var showCleanupRestrictedAlert = false
+    /// True while a one-tap cleanup delete is in flight. Prevents repeated taps
+    /// from enqueuing multiple PHPhotoLibrary delete requests whose system
+    /// confirmation dialogs would otherwise stack up and flush on next launch.
+    @State private var isCleanupDeleting = false
 
     // MARK: Pending-release cache
     // Recomputed only when redCount or storageStats precise sizes change.
@@ -425,6 +432,13 @@ struct ContentView: View {
             Button("common.cancel".localized, role: .cancel) {}
         } message: {
             Text("cleanup.auth.message".localized)
+        }
+        // Restricted by Screen Time / MDM: the app's Settings page has no Photos
+        // toggle, so we point the user to Screen Time instead of "Open Settings".
+        .alert("cleanup.auth.restricted.title".localized, isPresented: $showCleanupRestrictedAlert) {
+            Button("common.ok".localized, role: .cancel) {}
+        } message: {
+            Text("cleanup.auth.restricted.message".localized)
         }
 
     }
@@ -918,7 +932,7 @@ struct ContentView: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
-        .disabled(isAnimatingOut || isUndoRestoring)
+        .disabled(isAnimatingOut || isUndoRestoring || isCleanupDeleting)
     }
 
     /// Collect every asset whose freshest tag is "delete" and remove it from the
@@ -932,10 +946,22 @@ struct ContentView: View {
         }
         let ids = latest.compactMap { $0.value.status == "delete" ? $0.key : nil }
         guard !ids.isEmpty else { return }
+        // Re-entrancy guard: one delete request at a time. Without this, repeated
+        // taps (while iOS defers its delete confirmation) queue up dozens of
+        // requests that all surface at once on the next launch.
+        guard !isCleanupDeleting else { return }
+        isCleanupDeleting = true
 
         PhotoLibraryAuth.requestWriteAccess { granted in
             guard granted else {
-                showCleanupAuthAlert = true
+                isCleanupDeleting = false
+                // A restricted user has no Photos toggle in Settings, so route
+                // them to the Screen Time message instead of "Open Settings".
+                if PhotoLibraryAuth.isRestricted {
+                    showCleanupRestrictedAlert = true
+                } else {
+                    showCleanupAuthAlert = true
+                }
                 return
             }
             performCleanupDelete(ids: ids)
@@ -951,30 +977,37 @@ struct ContentView: View {
             result.enumerateObjects { a, _, _ in array.append(a) }
 
             DispatchQueue.main.async {
-                let bytes = storageStats.totalBestSize(for: array)
-                PHPhotoLibrary.shared().performChanges({
-                    PHAssetChangeRequest.deleteAssets(result)
-                }) { success, _ in
-                    DispatchQueue.main.async {
-                        // success=false means the user cancelled the system delete dialog.
-                        guard success else { return }
-                        let idSet = Set(ids)
+                // Fire the delete (and thus iOS's confirmation) only when the UI
+                // can present it: foreground-active and no menu/alert mid-transition.
+                // Otherwise UIKit drops the system dialog (nothing happens) or holds
+                // it to the next launch (a pile of dialogs). This waits until ready.
+                ForegroundGate.runWhenReady {
+                    let bytes = storageStats.totalBestSize(for: array)
+                    PHPhotoLibrary.shared().performChanges({
+                        PHAssetChangeRequest.deleteAssets(result)
+                    }) { success, _ in
+                        DispatchQueue.main.async {
+                            isCleanupDeleting = false
+                            // success=false means the user cancelled the system delete dialog.
+                            guard success else { return }
+                            let idSet = Set(ids)
 
-                        for tag in allTags where idSet.contains(tag.assetID) {
-                            modelContext.delete(tag)
+                            for tag in allTags where idSet.contains(tag.assetID) {
+                                modelContext.delete(tag)
+                            }
+                            try? modelContext.save()
+
+                            for id in idSet { tagCache.removeValue(forKey: id) }
+                            redCount = 0   // every delete-marked asset was just removed
+
+                            storageStats.recordCleanup(bytes: bytes)
+                            ratingPrompt.registerCleanup()
+                            recomputePendingRelease()
+                            storageStats.notePendingProgress(pendingReleaseBytes)
+                            WidgetCenter.shared.reloadAllTimelines()
+                            // The library change observer fires ReloadPhotos, which
+                            // refreshes the current source so deleted assets drop out.
                         }
-                        try? modelContext.save()
-
-                        for id in idSet { tagCache.removeValue(forKey: id) }
-                        redCount = 0   // every delete-marked asset was just removed
-
-                        storageStats.recordCleanup(bytes: bytes)
-                        ratingPrompt.registerCleanup()
-                        recomputePendingRelease()
-                        storageStats.notePendingProgress(pendingReleaseBytes)
-                        WidgetCenter.shared.reloadAllTimelines()
-                        // The library change observer fires ReloadPhotos, which
-                        // refreshes the current source so deleted assets drop out.
                     }
                 }
             }
