@@ -14,6 +14,7 @@
 
 import SwiftUI
 import RevenueCat
+import Combine
 
 @MainActor
 final class StoreManager: ObservableObject {
@@ -40,7 +41,6 @@ final class StoreManager: ObservableObject {
 
     @Published private(set) var nextRenewalDate: Date?
     @Published private(set) var currentSubscriptionType: SubscriptionType = .none
-    @Published private(set) var displayStatus: SubscriptionDisplayStatus = .none
 
     // UI state
     @Published var isLoadingPurchase: Bool = false
@@ -63,16 +63,24 @@ final class StoreManager: ObservableObject {
         return e.expirationDate == nil
     }
 
-    /// An auto-renewable subscription is active (has an expiration date).
+    /// An auto-renewable subscription is currently active (includes grace
+    /// period). Derived from `activeSubscriptions` rather than the entitlement:
+    /// once a lifetime purchase takes over the entitlement, the entitlement no
+    /// longer reflects a still-renewing subscription, but `activeSubscriptions`
+    /// does — which is what the "cancel your subscription" prompt needs.
     var hasActiveSubscription: Bool {
-        guard let e = activeEntitlement else { return false }
-        return e.expirationDate != nil
+        guard let info = customerInfo else { return false }
+        return !info.activeSubscriptions.isEmpty
     }
 
-    /// IDs the user currently has entitlement to (for "Current plan" badges).
+    /// IDs the user currently owns (for "Current plan" badges): the union of
+    /// active auto-renewable subscriptions and entitlement-granting products
+    /// (lifetime), so a subscription row keeps its "Current" badge even after
+    /// the entitlement is backed by a lifetime purchase.
     var purchasedProductIDs: Set<String> {
         guard let info = customerInfo else { return [] }
-        return Set(info.entitlements.active.values.map { $0.productIdentifier })
+        return info.activeSubscriptions
+            .union(info.entitlements.active.values.map { $0.productIdentifier })
     }
 
     /// The package matching the user's active subscription, if any.
@@ -95,13 +103,30 @@ final class StoreManager: ObservableObject {
 
     // MARK: - Lifecycle
 
+    /// Handle for the initial-load + customerInfoStream task so it can be
+    /// cancelled when the manager goes away (the stream never finishes on its
+    /// own, which would otherwise keep the Task alive forever).
+    private var customerInfoTask: Task<Void, Never>?
+
     init() {
-        Task {
-            async let offerings: Void = loadOfferings()
-            async let info: Void = refreshCustomerInfo()
-            _ = await (offerings, info)
-            await observeCustomerInfo()
+        customerInfoTask = Task { [weak self] in
+            // Initial parallel load. The strong reference is scoped so it isn't
+            // held across the never-finishing stream loop below.
+            if let self {
+                async let offerings: Void = self.loadOfferings()
+                async let info: Void = self.refreshCustomerInfo()
+                _ = await (offerings, info)
+            }
+            for await info in Purchases.shared.customerInfoStream {
+                guard !Task.isCancelled, let self else { return }
+                self.customerInfo = info
+                self.recomputeStatus()
+            }
         }
+    }
+
+    deinit {
+        customerInfoTask?.cancel()
     }
 
     // MARK: - Offerings (prices)
@@ -152,14 +177,20 @@ final class StoreManager: ObservableObject {
         recomputeStatus()
     }
 
-    func restore() async {
-        do {
-            let info = try await Purchases.shared.restorePurchases()
-            customerInfo = info
-            recomputeStatus()
-        } catch {
-            print("Restore failed: \(error)")
-        }
+    /// Outcome of a restore attempt that reached RevenueCat successfully.
+    /// Network / store errors are thrown instead.
+    enum RestoreOutcome {
+        /// The premium entitlement is active after restoring.
+        case restored
+        /// Restore succeeded but this Apple ID has nothing that grants premium.
+        case nothingToRestore
+    }
+
+    func restore() async throws -> RestoreOutcome {
+        let info = try await Purchases.shared.restorePurchases()
+        customerInfo = info
+        recomputeStatus()
+        return hasUnlockedPremium ? .restored : .nothingToRestore
     }
 
     // MARK: - Entitlements
@@ -175,37 +206,15 @@ final class StoreManager: ObservableObject {
         }
     }
 
-    /// Live entitlement updates (renewals, refunds, Ask-to-Buy approvals,
-    /// purchases made on other devices) without polling.
-    private func observeCustomerInfo() async {
-        for await info in Purchases.shared.customerInfoStream {
-            customerInfo = info
-            recomputeStatus()
-        }
-    }
-
     private func recomputeStatus() {
         guard let e = activeEntitlement else {
             nextRenewalDate = nil
             currentSubscriptionType = .none
-            displayStatus = .none
             return
         }
 
         nextRenewalDate = e.expirationDate
         currentSubscriptionType = subscriptionType(for: e.productIdentifier)
-
-        if let exp = e.expirationDate {
-            if e.periodType == .trial {
-                let days = Int(ceil(exp.timeIntervalSinceNow / 86_400.0))
-                displayStatus = .trial(daysLeft: max(days, 0), renewDate: exp)
-            } else {
-                displayStatus = .active(renewDate: exp)
-            }
-        } else {
-            // Lifetime — no renewal date.
-            displayStatus = .active(renewDate: nil)
-        }
     }
 
     private func subscriptionType(for productID: String) -> SubscriptionType {
@@ -234,55 +243,6 @@ enum SubscriptionType {
         case .quarterly: return String(localized: "sub.type.quarterly", defaultValue: "Quarterly")
         case .yearly: return String(localized: "sub.type.yearly", defaultValue: "Yearly")
         case .lifetime: return String(localized: "sub.type.lifetime", defaultValue: "Lifetime")
-        }
-    }
-}
-
-// MARK: - Display Status (UI)
-enum SubscriptionDisplayStatus: Equatable {
-    case none
-    case trial(daysLeft: Int, renewDate: Date?)
-    case active(renewDate: Date?)
-
-    var isPremium: Bool {
-        switch self {
-        case .none: return false
-        default: return true
-        }
-    }
-
-    var titleKey: LocalizedStringKey {
-        switch self {
-        case .trial: return "sub.info.trial"
-        case .active: return "sub.info.active"
-        case .none: return "sub.info.inactive"
-        }
-    }
-
-    var subtitleText: String {
-        switch self {
-        case .trial(let daysLeft, _):
-            return "Start 7 days trial · \(max(daysLeft, 0)) days left"
-        case .active:
-            return ""
-        case .none:
-            return ""
-        }
-    }
-
-    var color: Color {
-        switch self {
-        case .trial: return .orange
-        case .active: return .green
-        case .none: return .secondary
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .trial: return "clock.badge.checkmark"
-        case .active: return "checkmark.seal.fill"
-        case .none: return "xmark.seal"
         }
     }
 }

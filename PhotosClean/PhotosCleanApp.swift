@@ -55,14 +55,31 @@ struct PhotosCleanApp: App {
         // Purchases.shared access. (@StateObject is created lazily when the
         // scene's body is first evaluated, i.e. after this init, so this is
         // guaranteed to run first.)
+        #if DEBUG
+        Purchases.logLevel = .debug
+        #else
         Purchases.logLevel = .error
+        #endif
         Purchases.configure(withAPIKey: "appl_EAMUZfYdOxhWkFPIQBureXUHvvV")
 
         // 启动相册监听器
         _ = PhotoLibraryObserver.shared
-        // 首次启动主动请求 .readWrite 权限；否则系统默认只授予 .addOnly，
-        // 之后 PHAssetChangeRequest.deleteAssets 会静默失败。
-        PhotoLibraryAuth.requestWriteAccess { _ in }
+        // 注意：相册权限请求不在 init 里做（启动瞬间弹系统权限框体验差，
+        // 且窗口尚未就绪）。改为主窗口首次出现并稳定后再请求，
+        // 见 requestPhotoAuthIfNeeded()。
+    }
+
+    /// 首次启动主动请求 .readWrite 权限；否则系统默认只授予 .addOnly，
+    /// 之后 PHAssetChangeRequest.deleteAssets 会静默失败。
+    /// 推迟到主窗口出现并稳定后再弹；权限状态已确定（已授权 / 已拒绝 /
+    /// 受限）的用户不会再次弹框，老用户路径不受影响。
+    private func requestPhotoAuthIfNeeded() {
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .notDetermined else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            ForegroundGate.runWhenReady {
+                PhotoLibraryAuth.requestWriteAccess { _ in }
+            }
+        }
     }
 
     var body: some Scene {
@@ -72,6 +89,7 @@ struct PhotosCleanApp: App {
                 .environmentObject(paywallGate)
                 .environmentObject(storageStats)
                 .environmentObject(ratingPrompt)
+                .onAppear { requestPhotoAuthIfNeeded() }
         }
         .modelContainer(sharedModelContainer)
         .onChange(of: scenePhase) { _, newPhase in

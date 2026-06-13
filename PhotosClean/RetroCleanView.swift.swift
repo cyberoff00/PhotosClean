@@ -4,6 +4,7 @@ import PhotosUI
 import SwiftData
 import AVKit
 import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - Main View
 struct RetroCleanView: View {
@@ -11,9 +12,9 @@ struct RetroCleanView: View {
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject var storeManager: StoreManager
     @EnvironmentObject var paywallGate: PaywallGate
+    @EnvironmentObject var storageStats: StorageStats
 
     @Environment(\.dismiss) private var dismiss
-    @Query(sort: \PhotoTag.createdAt, order: .reverse) private var allTags: [PhotoTag]
 
     let assets: [PHAsset]
     @State private var currentAssetID: String
@@ -31,6 +32,9 @@ struct RetroCleanView: View {
     @State private var cardImageRequestIDs: [String: PHImageRequestID] = [:]
     @State private var tagCache: [String: PhotoTag] = [:]
     @State private var assetOrderByID: [String: Int] = [:]
+    // Throttled SwiftData save: coalesce per-swipe writes into one save (~0.6s
+    // after the last change), with a forced flush on disappear/background.
+    @State private var pendingTagSave: DispatchWorkItem?
 
     // Live / Video
     @State private var livePhoto: PHLivePhoto?
@@ -41,6 +45,7 @@ struct RetroCleanView: View {
     @State private var pendingLivePlay = false
     @State private var livePhotoCache: [String: PHLivePhoto] = [:]
     @State private var liveWarmInFlight: Set<String> = []
+    @State private var liveWarmRequestIDs: [String: PHImageRequestID] = [:]
     private static let liveWarmAhead = 2
     private static let liveCacheCap = 5
     @State private var player: AVPlayer?
@@ -67,6 +72,7 @@ struct RetroCleanView: View {
     @State private var showShareOptions = false
     @State private var showPreview = false
     @State private var previewImage: UIImage?
+    @State private var isPreparingShareImage = false
 
     // Zoom
     @State private var imageScale: CGFloat = 1.0
@@ -136,7 +142,9 @@ struct RetroCleanView: View {
     // MARK: - Filmstrip
     private var filmstripAssets: [PHAsset] { filmstripSnapshot }
     private var currentDisplayedAssetID: String? {
-        activeCard?.asset.localIdentifier ?? buffer.first?.asset.localIdentifier ?? currentAssetID
+        // While waiting for the in-order next card, buffer.first may be a later
+        // photo — highlight the asset we're actually advancing to instead.
+        activeCard?.asset.localIdentifier ?? currentAssetID
     }
     @State private var filmstripSnapshot: [PHAsset] = []
 
@@ -180,7 +188,10 @@ struct RetroCleanView: View {
     }
 
     private var shouldShowLoadingState: Bool {
-        activeCard == nil && buffer.isEmpty && !shouldShowDoneState
+        // No active card (even if later cards are buffered) means we're waiting
+        // for the in-order next photo — show the spinner instead of letting a
+        // later buffered card jump to the top of the stack.
+        activeCard == nil && !shouldShowDoneState
     }
 
     // MARK: - Body
@@ -215,7 +226,7 @@ struct RetroCleanView: View {
                     ProgressView()
                         .opacity(shouldShowLoadingState ? 1 : 0)
 
-                    if activeCard != nil || !buffer.isEmpty {
+                    if activeCard != nil {
                         cardStackView
                             .padding(20)
                     }
@@ -240,6 +251,10 @@ struct RetroCleanView: View {
             if showPreview, let preview = previewImage {
                 previewOverlay(image: preview)
             }
+
+            if isPreparingShareImage {
+                sharePreparingOverlay
+            }
         }
         // Retro is pushed from a NavigationStack (Library). Hide the default navigation bar
         // so its extra top inset doesn't push the whole page down compared to ContentView.
@@ -252,12 +267,16 @@ struct RetroCleanView: View {
         .onDisappear {
             stopAllMedia()
             cancelPendingImageRequests()
+            cancelLiveWarmRequests()
+            flushPendingTagSave()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             stopAllMedia()
+            flushPendingTagSave()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             stopAllMedia()
+            flushPendingTagSave()
         }
         .onChange(of: activeCard?.asset.localIdentifier) { _, _ in
             stopAllMedia()
@@ -472,6 +491,11 @@ struct RetroCleanView: View {
                 tag.status = status
                 tag.createdAt = Date()
             }
+
+            if status == "delete" {
+                self.storageStats.noteAsset(card.asset)
+            }
+
             self.paywallGate.recordSwipe(isPremium: self.storeManager.hasUnlockedPremium)
 
             // Hard wall: auto-present the paywall the moment the daily free quota runs out.
@@ -515,17 +539,21 @@ struct RetroCleanView: View {
                     self.normalizeBuffer(excluding: nextAssetID)
                     self.syncNoteForCurrent()
                     self.ensureBuffer()
-                } else if let first = self.buffer.first {
-                    // buffer 里没有精确匹配，用第一张
-                    self.activeCard = first
-                    self.currentAssetID = first.asset.localIdentifier
-                    self.normalizeBuffer(excluding: first.asset.localIdentifier)
-                    self.syncNoteForCurrent()
-                    self.ensureBuffer()
                 } else {
-                    // buffer 空了，重新加载
+                    // 下一张还没加载完：保持 currentAssetID 指向顺序上的下一张并
+                    // 显示 loading 等它送达。不能拿 buffer 里更后面的卡顶替——
+                    // 顶替会把未到的那张挤出 keep 窗口（回调被 order 守卫丢弃），
+                    // 该照片本会话就永远不会出现了。
                     self.activeCard = nil
-                    self.bootstrapBuffer(force: true)
+                    if self.loadingIDs.contains(nextAssetID) {
+                        // 请求已在途：到货后 ensureBuffer 的回调会按
+                        // card.id == currentAssetID 回填 activeCard；失败则由
+                        // handleCardLoadFailure 跳过并推进。
+                        self.ensureBuffer()
+                    } else {
+                        // 没有在途请求（如此前失败被清理）→ 重新发起加载
+                        self.bootstrapBuffer(force: false)
+                    }
                 }
 
                 self.isAnimatingOut = false
@@ -603,9 +631,15 @@ struct RetroCleanView: View {
 
     // MARK: - Buffer Management
     private func rebuildTagCache() {
+        // One-shot fetch instead of a live @Query: this view only reads tags via
+        // tagCache, and a @Query would re-fetch the whole table on every save.
+        let descriptor = FetchDescriptor<PhotoTag>(
+            sortBy: [SortDescriptor(\PhotoTag.createdAt, order: .reverse)]
+        )
+        let tags = (try? modelContext.fetch(descriptor)) ?? []
         var map: [String: PhotoTag] = [:]
-        map.reserveCapacity(allTags.count)
-        for tag in allTags where map[tag.assetID] == nil {
+        map.reserveCapacity(tags.count)
+        for tag in tags where map[tag.assetID] == nil {
             map[tag.assetID] = tag
         }
         tagCache = map
@@ -641,10 +675,10 @@ struct RetroCleanView: View {
         if force {
             sourceRevision += 1
             cancelPendingImageRequests()
+            cancelLiveWarmRequests()
             buffer.removeAll()
             loadingIDs.removeAll()
             livePhotoCache.removeAll()
-            liveWarmInFlight.removeAll()
             activeCard = nil
             settleOffset = .zero
             isAnimatingOut = false
@@ -657,10 +691,18 @@ struct RetroCleanView: View {
 
         loadingIDs.insert(id)
 
-        cardImageRequestIDs[id] = loadCardState(for: currentAsset) { card in
+        cardImageRequestIDs[id] = loadCardState(for: currentAsset) { card, isDegraded in
             DispatchQueue.main.async {
                 self.loadingIDs.remove(id)
+                if !isDegraded {
+                    self.cardImageRequestIDs.removeValue(forKey: id)
+                }
                 guard revision == self.sourceRevision else { return }
+
+                guard let card else {
+                    self.handleCardLoadFailure(assetID: id)
+                    return
+                }
 
                 // The user may have swiped away during the degraded→full load window.
                 // Only adopt this card as active if it's still the current one;
@@ -704,10 +746,19 @@ struct RetroCleanView: View {
 
             loadingIDs.insert(id)
 
-            cardImageRequestIDs[id] = loadCardState(for: asset) { card in
+            cardImageRequestIDs[id] = loadCardState(for: asset) { card, isDegraded in
                 DispatchQueue.main.async {
                     self.loadingIDs.remove(id)
+                    if !isDegraded {
+                        self.cardImageRequestIDs.removeValue(forKey: id)
+                    }
                     guard revision == self.sourceRevision else { return }
+
+                    guard let card else {
+                        self.handleCardLoadFailure(assetID: id)
+                        return
+                    }
+
                     guard let order = self.assetOrderByID[id] else { return }
 
                     // Late async callbacks from older swipes can arrive out of order.
@@ -729,8 +780,10 @@ struct RetroCleanView: View {
 
                     self.insertBufferInOrder(card)
 
-                    if self.activeCard == nil {
-                        self.activeCard = self.buffer.first
+                    // 回填 activeCard 只允许顺序上正等待的那张（currentAssetID），
+                    // 否则后面的卡会顶替还没到的卡，造成闪变/进度错位。
+                    if self.activeCard == nil, id == self.currentAssetID {
+                        self.activeCard = card
                         self.syncNoteForCurrent()
                     }
                 }
@@ -744,6 +797,42 @@ struct RetroCleanView: View {
             buffer.removeAll(where: { !keepIDs.contains($0.asset.localIdentifier) })
         } else {
             buffer.removeAll()
+        }
+    }
+
+    /// A card request finished without an image (e.g. iCloud fetch failed).
+    /// If we're currently blocked waiting on that exact asset, skip past it so
+    /// the loading state can never get stuck forever.
+    private func handleCardLoadFailure(assetID: String) {
+        loadingIDs.remove(assetID)
+        cardImageRequestIDs.removeValue(forKey: assetID)
+
+        // A degraded image may have been delivered earlier; if a card already
+        // exists for this asset there's nothing to recover from.
+        guard currentAssetID == assetID,
+              activeCard?.asset.localIdentifier != assetID,
+              !buffer.contains(where: { $0.asset.localIdentifier == assetID }) else { return }
+
+        guard let failedIndex = assetOrderByID[assetID] else { return }
+        let nextIndex = failedIndex + 1
+        guard nextIndex < assets.count else {
+            // Failed on the last photo → fall through to the done state.
+            refreshFilmstripSnapshot()
+            return
+        }
+
+        let nextAssetID = assets[nextIndex].localIdentifier
+        currentAssetID = nextAssetID
+
+        if let nextCard = buffer.first(where: { $0.asset.localIdentifier == nextAssetID }) {
+            activeCard = nextCard
+            normalizeBuffer(excluding: nextAssetID)
+            syncNoteForCurrent()
+            ensureBuffer()
+        } else if loadingIDs.contains(nextAssetID) {
+            ensureBuffer()
+        } else {
+            bootstrapBuffer(force: false)
         }
     }
 
@@ -775,12 +864,23 @@ struct RetroCleanView: View {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: undoTimeout)
 
-        cardImageRequestIDs[lastAssetID] = loadCardState(for: assets[lastIndex]) { restored in
+        cardImageRequestIDs[lastAssetID] = loadCardState(for: assets[lastIndex]) { restored, isDegraded in
             DispatchQueue.main.async {
                 undoTimeout.cancel()
-                self.cardImageRequestIDs.removeValue(forKey: lastAssetID)
+                if !isDegraded {
+                    self.cardImageRequestIDs.removeValue(forKey: lastAssetID)
+                }
                 guard revision == self.sourceRevision else {
                     self.isUndoRestoring = false
+                    return
+                }
+                guard let restored else {
+                    // Restore-load failed (e.g. iCloud unreachable). Fall back to
+                    // a full bootstrap; if the asset keeps failing, the failure
+                    // path will skip past it instead of hanging.
+                    self.isUndoRestoring = false
+                    self.currentAssetID = lastAssetID
+                    self.bootstrapBuffer(force: true)
                     return
                 }
                 self.currentAssetID = lastAssetID
@@ -805,12 +905,13 @@ struct RetroCleanView: View {
     }
 
     // MARK: - Image Loading
+    /// Requests the card image. `completion` may be called twice (degraded then
+    /// full quality). On a final failure it is called once with `nil` so callers
+    /// can unblock the loading state instead of waiting forever.
     @discardableResult
-    func loadCardState(for asset: PHAsset, completion: @escaping (CardState) -> Void) -> PHImageRequestID {
+    func loadCardState(for asset: PHAsset, completion: @escaping (CardState?, _ isDegraded: Bool) -> Void) -> PHImageRequestID {
         let scale = UIScreen.main.scale
-        let width = UIScreen.main.bounds.width - 40
-        let height = width * 4 / 3
-        let target = CGSize(width: width * scale, height: height * scale)
+        let target = CGSize(width: cardWidth * scale, height: cardHeight * scale)
 
         let opt = PHImageRequestOptions()
         opt.isNetworkAccessAllowed = true
@@ -824,8 +925,16 @@ struct RetroCleanView: View {
             options: opt
         ) { img, info in
             if let cancelled = info?[PHImageCancelledKey] as? Bool, cancelled { return }
-            guard let img else { return }
-            completion(CardState(asset: asset, image: img))
+            let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            guard let img else {
+                // Only report failure on the final delivery; a nil degraded pass
+                // can still be followed by a successful full-quality one.
+                if !isDegraded {
+                    completion(nil, false)
+                }
+                return
+            }
+            completion(CardState(asset: asset, image: img), isDegraded)
         }
     }
 
@@ -841,10 +950,15 @@ struct RetroCleanView: View {
         guard let asset = activeCard?.asset,
               asset.mediaSubtypes.contains(.photoLive) else { return }
 
-        // Tapped again while a slow (iCloud) load is in progress — cancel it.
+        // Tapped again while a slow (iCloud) load is in progress — cancel it,
+        // including the actual in-flight request so it stops downloading.
         if isLoadingLivePhoto {
             isLoadingLivePhoto = false
             pendingLivePlay = false
+            if livePhotoPreloadID != PHInvalidImageRequestID {
+                PHImageManager.default().cancelImageRequest(livePhotoPreloadID)
+                livePhotoPreloadID = PHInvalidImageRequestID
+            }
             return
         }
         if isPlayingLivePhoto {
@@ -921,16 +1035,27 @@ struct RetroCleanView: View {
             let scale = UIScreen.main.scale
             let target = CGSize(width: cardWidth * scale, height: cardHeight * scale)
 
-            PHImageManager.default().requestLivePhoto(
+            liveWarmRequestIDs[id] = PHImageManager.default().requestLivePhoto(
                 for: asset, targetSize: target, contentMode: .aspectFit, options: opt
             ) { live, _ in
                 DispatchQueue.main.async {
                     self.liveWarmInFlight.remove(id)
+                    self.liveWarmRequestIDs.removeValue(forKey: id)
                     guard let live else { return }
                     self.cacheLivePhoto(live, for: id)
                 }
             }
         }
+    }
+
+    /// Cancel all in-flight Live Photo warm-up downloads (on disappear or when
+    /// the buffer is force-rebuilt) so they stop competing for bandwidth.
+    private func cancelLiveWarmRequests() {
+        for requestID in liveWarmRequestIDs.values {
+            PHImageManager.default().cancelImageRequest(requestID)
+        }
+        liveWarmRequestIDs.removeAll()
+        liveWarmInFlight.removeAll()
     }
 
     private func cacheLivePhoto(_ live: PHLivePhoto, for id: String) {
@@ -1215,11 +1340,27 @@ struct RetroCleanView: View {
     }
 
     func presentShareSheet(items: [Any]) {
+        guard let window = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive })?
+            .windows.first(where: { $0.isKeyWindow }) else { return }
+
+        // Present from the top-most presented controller so the sheet isn't
+        // swallowed by an overlay already on screen.
+        var presenter = window.rootViewController
+        while let presented = presenter?.presentedViewController {
+            presenter = presented
+        }
+        guard let presenter else { return }
+
         let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
-        UIApplication.shared.connectedScenes
-            .compactMap { ($0 as? UIWindowScene)?.windows.first?.rootViewController }
-            .first?
-            .present(vc, animated: true)
+        // iPad requires a popover anchor; without it UIKit crashes on present.
+        if let popover = vc.popoverPresentationController {
+            popover.sourceView = window
+            popover.sourceRect = CGRect(x: window.bounds.midX, y: window.bounds.midY, width: 1, height: 1)
+            popover.permittedArrowDirections = []
+        }
+        presenter.present(vc, animated: true)
     }
     private var shareOptionsOverlay: some View {
         ZStack {
@@ -1345,25 +1486,115 @@ struct RetroCleanView: View {
 
     // MARK: - 添加分享逻辑函数（在 presentShareSheet 函数后添加）
 
+    private var sharePreparingOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.25)
+                .ignoresSafeArea()
+            HStack(spacing: 10) {
+                ProgressView()
+                Text("share.preparing".localized)
+                    .font(.subheadline)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        }
+    }
+
     private func shareOriginalImage() {
         showShareOptions = false
-        guard let image = activeCard?.image else { return }
-        presentShareSheet(items: [image])
+        guard !isPreparingShareImage else { return }
+        guard let asset = activeCard?.asset else { return }
+        isPreparingShareImage = true
+
+        requestOriginalImageData(for: asset) { data, dataUTI in
+            DispatchQueue.global(qos: .userInitiated).async {
+                // Write the untouched original bytes to a temp file so the share
+                // sheet gets the real full-quality photo (incl. HEIC/metadata),
+                // not the screen-sized card image.
+                var item: Any?
+                if let data {
+                    let ext = dataUTI.flatMap { UTType($0)?.preferredFilenameExtension } ?? "jpg"
+                    let url = FileManager.default.temporaryDirectory
+                        .appendingPathComponent(UUID().uuidString)
+                        .appendingPathExtension(ext)
+                    if (try? data.write(to: url)) != nil {
+                        item = url
+                    } else {
+                        item = UIImage(data: data)
+                    }
+                }
+                DispatchQueue.main.async {
+                    self.isPreparingShareImage = false
+                    if let item {
+                        self.presentShareSheet(items: [item])
+                    } else if let fallback = self.activeCard?.image {
+                        self.presentShareSheet(items: [fallback])
+                    }
+                }
+            }
+        }
     }
 
     private func shareImageWithNote() {
         showShareOptions = false
-        guard let image = activeCard?.image,
-              let assetID = activeCard?.asset.localIdentifier,
-              let note = tagCache[assetID]?.note,
-              !note.isEmpty else {
-            presentShareSheet(items: [activeCard?.image ?? UIImage()])
+        guard !isPreparingShareImage else { return }
+        guard let asset = activeCard?.asset else { return }
+
+        let note = tagCache[asset.localIdentifier]?.note ?? ""
+        guard !note.isEmpty else {
+            shareOriginalImage()
             return
         }
 
-        let composedImage = composeImageWithNote(image: image, note: note)
-        previewImage = composedImage
-        showPreview = true
+        isPreparingShareImage = true
+        requestOriginalImageData(for: asset) { data, _ in
+            DispatchQueue.global(qos: .userInitiated).async {
+                // Compose from the full-quality original, capped at 4096px on the
+                // long edge so the rendered bitmap can't blow up memory.
+                let base = data.flatMap { UIImage(data: $0) }.map {
+                    self.downscaledIfNeeded($0, maxDimension: 4096)
+                }
+                let composed = base.map { self.composeImageWithNote(image: $0, note: note) }
+                DispatchQueue.main.async {
+                    self.isPreparingShareImage = false
+                    if let composed {
+                        self.previewImage = composed
+                        self.showPreview = true
+                    } else if let fallback = self.activeCard?.image {
+                        self.previewImage = self.composeImageWithNote(image: fallback, note: note)
+                        self.showPreview = true
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fetch the original photo data (network allowed, current version).
+    private func requestOriginalImageData(for asset: PHAsset,
+                                          completion: @escaping (Data?, String?) -> Void) {
+        let opt = PHImageRequestOptions()
+        opt.isNetworkAccessAllowed = true
+        opt.deliveryMode = .highQualityFormat
+        opt.version = .current
+        PHImageManager.default().requestImageDataAndOrientation(for: asset, options: opt) { data, dataUTI, _, _ in
+            completion(data, dataUTI)
+        }
+    }
+
+    private func downscaledIfNeeded(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
+        let pixelWidth = image.size.width * image.scale
+        let pixelHeight = image.size.height * image.scale
+        let longest = max(pixelWidth, pixelHeight)
+        guard longest > maxDimension, longest > 0 else { return image }
+
+        let ratio = maxDimension / longest
+        let newSize = CGSize(width: floor(pixelWidth * ratio), height: floor(pixelHeight * ratio))
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: newSize, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: newSize))
+        }
     }
 
     private func composeImageWithNote(image: UIImage, note: String) -> UIImage {
@@ -1396,7 +1627,9 @@ struct RetroCleanView: View {
 
         let rect = CGRect(x: 0, y: 0, width: imageSize.width, height: totalHeight)
 
-        UIGraphicsBeginImageContextWithOptions(rect.size, true, 0)
+        // Render at the source image's scale (1x for data-decoded originals) so a
+        // 4096px base isn't multiplied by the 2-3x screen scale into a huge bitmap.
+        UIGraphicsBeginImageContextWithOptions(rect.size, true, image.scale)
         defer { UIGraphicsEndImageContext() }
 
         UIColor(red: 0.97, green: 0.97, blue: 0.97, alpha: 1.0).setFill()
@@ -1434,8 +1667,28 @@ struct RetroCleanView: View {
             modelContext.insert(tag)
         }
         mutate(tag)
-        try? modelContext.save()
         tagCache[assetID] = tag
+        // Don't save synchronously on every swipe — coalesce into one debounced
+        // write. In-memory changes are immediately visible to other views on the
+        // same container; flushPendingTagSave() guarantees durability on exit.
+        scheduleTagSave()
+    }
+
+    private func scheduleTagSave() {
+        pendingTagSave?.cancel()
+        let work = DispatchWorkItem {
+            self.pendingTagSave = nil
+            try? self.modelContext.save()
+        }
+        pendingTagSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    private func flushPendingTagSave() {
+        guard pendingTagSave != nil else { return }
+        pendingTagSave?.cancel()
+        pendingTagSave = nil
+        try? modelContext.save()
     }
 }
 

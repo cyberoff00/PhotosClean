@@ -72,10 +72,21 @@ final class RatingPrompt: ObservableObject {
 
     /// User said they like it → route to the native App Store review prompt and
     /// never ask again.
+    ///
+    /// The review request is deferred: calling `requestReview()` while the
+    /// "Enjoying TastyTidy?" alert is still animating away makes the system
+    /// silently drop the review sheet. Wait ~0.9s for the dismissal to settle,
+    /// then let ForegroundGate confirm nothing else is mid-transition.
     func userLikes(_ requestReview: RequestReviewAction) {
         markPromptShown()
         didRate = true
-        requestReview()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+            ForegroundGate.runWhenReady {
+                Task { @MainActor in
+                    requestReview()
+                }
+            }
+        }
     }
 
     /// User said "not really" → open the in-app feedback page. We mark the prompt

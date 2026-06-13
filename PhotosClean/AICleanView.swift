@@ -81,6 +81,11 @@ struct AICleanResultsView: View {
     @State private var progressText: String? = nil
     @State private var selected: SelectedPhoto? = nil
     @State private var navigationSnapshot: [PHAsset] = []
+    /// Loads only once per navigation push — re-appearing (e.g. popping back from
+    /// LibraryCleanView) must not re-run the whole scan.
+    @State private var hasLoaded = false
+    /// The in-flight scan, kept so onDisappear can cancel it.
+    @State private var loadTask: Task<Void, Never>? = nil
 
     private let columns = [
         GridItem(.flexible(), spacing: 2),
@@ -127,11 +132,26 @@ struct AICleanResultsView: View {
                     }
                     .padding(.horizontal, 2)
                 }
+                // Optional manual re-scan; the automatic scan only runs once
+                // per push (see onAppear guard below).
+                .refreshable { await refresh() }
             }
         }
         .navigationTitle(category.title)
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { load() }
+        .onAppear {
+            // First appearance kicks off the scan. If a previous scan was
+            // cancelled mid-flight (user left while loading), restart it;
+            // otherwise returning from a detail push reuses the results.
+            if loadTask == nil && (!hasLoaded || isLoading) {
+                hasLoaded = true
+                startLoad()
+            }
+        }
+        .onDisappear {
+            loadTask?.cancel()
+            loadTask = nil
+        }
         .navigationDestination(item: $selected) { sel in
             let list = navigationSnapshot
             let idx = list.firstIndex(where: { $0.localIdentifier == sel.id }) ?? 0
@@ -139,56 +159,67 @@ struct AICleanResultsView: View {
         }
     }
 
-    private func load() {
+    private func startLoad() {
+        loadTask?.cancel()
         isLoading = true
         progressText = nil
 
-        switch category {
-        case .screenshots:
-            assets = fetchScreenshots()
-            isLoading = false
+        loadTask = Task { @MainActor in
+            defer { loadTask = nil }
 
-        case .possibleDuplicates:
-            Task { @MainActor in
+            let result: [PHAsset]
+            switch category {
+            case .screenshots:
+                result = await fetchScreenshots()
+            case .possibleDuplicates:
                 progressText = "ai.progress.scan800".localized
-                let result = await findPossibleDuplicates(limit: 800)
-                assets = result
-                isLoading = false
-                progressText = nil
+                result = await findPossibleDuplicates(limit: 800)
+            case .blurry:
+                progressText = "ai.progress.scan500".localized
+                result = await findBlurryPhotos(limit: 500)
             }
 
-        case .blurry:
-            Task { @MainActor in
-                progressText = "ai.progress.scan500".localized
-                let result = await findBlurryPhotos(limit: 500)
-                assets = result
-                isLoading = false
-                progressText = nil
-            }
+            guard !Task.isCancelled else { return }
+            assets = result
+            isLoading = false
+            progressText = nil
         }
     }
 
+    /// Manual pull-to-refresh re-scan.
+    @MainActor
+    private func refresh() async {
+        startLoad()
+        await loadTask?.value
+    }
+
     // MARK: - Screenshot (robust)
-    private func fetchScreenshots() -> [PHAsset] {
-        let options = PHFetchOptions()
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        // mediaSubtype bitmask contains screenshot
-        let mask = PHAssetMediaSubtype.photoScreenshot.rawValue
-        options.predicate = NSPredicate(format: "(mediaSubtype & %d) != 0", mask)
-        let fetch = PHAsset.fetchAssets(with: .image, options: options)
-        var arr: [PHAsset] = []
-        arr.reserveCapacity(fetch.count)
-        fetch.enumerateObjects { asset, _, _ in
-            arr.append(asset)
+    // PHAsset fetch/enumerate over the whole library is slow — keep it off the
+    // main thread (PHAsset fetching is thread-safe) and publish on return.
+    private func fetchScreenshots() async -> [PHAsset] {
+        await withCheckedContinuation { (cont: CheckedContinuation<[PHAsset], Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let options = PHFetchOptions()
+                options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+                // mediaSubtype bitmask contains screenshot
+                let mask = PHAssetMediaSubtype.photoScreenshot.rawValue
+                options.predicate = NSPredicate(format: "(mediaSubtype & %d) != 0", mask)
+                let fetch = PHAsset.fetchAssets(with: .image, options: options)
+                var arr: [PHAsset] = []
+                arr.reserveCapacity(fetch.count)
+                fetch.enumerateObjects { asset, _, _ in
+                    arr.append(asset)
+                }
+                cont.resume(returning: arr)
+            }
         }
-        return arr
     }
 
     // MARK: - Possible duplicates (cheap heuristic)
     // Strategy: recent N images -> key by (creationDate rounded to minute, pixelWidth, pixelHeight)
     // If a key has 2+ photos, mark them as possible duplicates.
     private func findPossibleDuplicates(limit: Int) async -> [PHAsset] {
-        let fetched = fetchRecentImages(limit: limit)
+        let fetched = await fetchRecentImages(limit: limit)
         let calendar = Calendar.current
 
         // Build buckets
@@ -223,7 +254,7 @@ struct AICleanResultsView: View {
     // Strategy: request small thumbnail -> run CIEdges -> compute mean intensity.
     // Lower mean => fewer edges => likely blur.
     private func findBlurryPhotos(limit: Int) async -> [PHAsset] {
-        let fetched = fetchRecentImages(limit: limit)
+        let fetched = await fetchRecentImages(limit: limit)
         var results: [PHAsset] = []
 
         let manager = PHImageManager.default()
@@ -235,8 +266,13 @@ struct AICleanResultsView: View {
         options.isNetworkAccessAllowed = false
 
         let targetSize = CGSize(width: 240, height: 240)
+        let context = blurCIContext
+        let colorSpace = blurRenderColorSpace
 
         for (idx, asset) in fetched.enumerated() {
+            // Bail out early when the scan task is cancelled (view dismissed).
+            if Task.isCancelled { break }
+
             await MainActor.run {
                 // Update progress every 40 items
                 if idx % 40 == 0 {
@@ -244,20 +280,25 @@ struct AICleanResultsView: View {
                 }
             }
 
-            let maybeBlurry = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            // The PHImageManager result handler runs on the main thread — only
+            // grab the image there; the Core Image work happens off-main below.
+            let image: UIImage? = await withCheckedContinuation { (cont: CheckedContinuation<UIImage?, Never>) in
                 manager.requestImage(
                     for: asset,
                     targetSize: targetSize,
                     contentMode: .aspectFill,
                     options: options
                 ) { image, _ in
-                    guard let image else {
-                        cont.resume(returning: false)
-                        return
-                    }
-                    cont.resume(returning: isLikelyBlurry(image))
+                    cont.resume(returning: image)
                 }
             }
+
+            guard let image else { continue }
+
+            // CIContext is thread-safe; run the edge analysis off the main thread.
+            let maybeBlurry = await Task.detached(priority: .utility) {
+                Self.isLikelyBlurry(image, context: context, colorSpace: colorSpace)
+            }.value
 
             if maybeBlurry {
                 results.append(asset)
@@ -268,7 +309,9 @@ struct AICleanResultsView: View {
         return results
     }
 
-    private func isLikelyBlurry(_ uiImage: UIImage) -> Bool {
+    // nonisolated: View statics inherit @MainActor, which would silently hop this
+    // CPU-bound Core Image work back onto the main thread from the detached task.
+    nonisolated private static func isLikelyBlurry(_ uiImage: UIImage, context: CIContext, colorSpace: CGColorSpace) -> Bool {
         guard let cg = uiImage.cgImage else { return false }
         let ci = CIImage(cgImage: cg)
         let edges = ci.applyingFilter("CIEdges", parameters: [kCIInputIntensityKey: 1.0])
@@ -283,13 +326,13 @@ struct AICleanResultsView: View {
         )?.outputImage else { return false }
 
         var pixel = [UInt8](repeating: 0, count: 4)
-        blurCIContext.render(
+        context.render(
             avg,
             toBitmap: &pixel,
             rowBytes: 4,
             bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
             format: .RGBA8,
-            colorSpace: blurRenderColorSpace
+            colorSpace: colorSpace
         )
         let mean = (Double(pixel[0]) + Double(pixel[1]) + Double(pixel[2])) / (3.0 * 255.0)
 
@@ -299,16 +342,22 @@ struct AICleanResultsView: View {
     }
 
     // MARK: - Helpers
-    private func fetchRecentImages(limit: Int) -> [PHAsset] {
-        let options = PHFetchOptions()
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        options.fetchLimit = limit
-        let fetch = PHAsset.fetchAssets(with: .image, options: options)
-        var arr: [PHAsset] = []
-        arr.reserveCapacity(fetch.count)
-        fetch.enumerateObjects { asset, _, _ in
-            arr.append(asset)
+    // Off-main for the same reason as fetchScreenshots: enumerating hundreds of
+    // assets on the main thread causes a visible hitch.
+    private func fetchRecentImages(limit: Int) async -> [PHAsset] {
+        await withCheckedContinuation { (cont: CheckedContinuation<[PHAsset], Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let options = PHFetchOptions()
+                options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+                options.fetchLimit = limit
+                let fetch = PHAsset.fetchAssets(with: .image, options: options)
+                var arr: [PHAsset] = []
+                arr.reserveCapacity(fetch.count)
+                fetch.enumerateObjects { asset, _, _ in
+                    arr.append(asset)
+                }
+                cont.resume(returning: arr)
+            }
         }
-        return arr
     }
 }

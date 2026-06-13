@@ -6,6 +6,7 @@ import AVKit
 import PhotosUI
 import UIKit
 import Combine
+import UniformTypeIdentifiers
 
 // MARK: - ContentView
 struct ContentView: View {
@@ -30,6 +31,12 @@ struct ContentView: View {
     @State private var isUndoRestoring = false
     @State private var sourceRevision: Int = 0
     @State private var cardImageRequestIDs: [String: PHImageRequestID] = [:]
+    /// Failed card-image loads (e.g. iCloud on bad network) retried a few times
+    /// before the asset is skipped, so loading can always end.
+    @State private var cardLoadRetryCounts: [String: Int] = [:]
+    private static let cardLoadMaxRetries = 2
+    /// First appear does a full load; later appears only do light revalidation.
+    @State private var hasLoadedOnce = false
 
     // MARK: Date source mode (Today / Random Date)
     enum DateSourceMode: Equatable {
@@ -43,9 +50,15 @@ struct ContentView: View {
         case month
     }
 
-    @State private var dateSourceMode: DateSourceMode = .today
+    // Default experience is a random historical day. Today / This week / a
+    // specific month are reachable from the single source entry in the header.
+    @State private var dateSourceMode: DateSourceMode = .random
     @State private var todayScope: TodayScope = .day
     @State private var randomPickedDay: Date? = nil
+    /// The month shown when `todayScope == .month`. Lets the user browse any
+    /// historical month, not just the current one.
+    @State private var monthReference: Date = Date()
+    @State private var showMonthPicker = false
 
     // MARK: Random-day pre-warming
     // Pick the *next* random day ahead of time and pre-download its first photos
@@ -120,6 +133,9 @@ struct ContentView: View {
     /// a Live Photo and tapping plays instantly (no spinner).
     @State private var livePhotoCache: [String: PHLivePhoto] = [:]
     @State private var liveWarmInFlight: Set<String> = []
+    /// In-flight Live Photo warm-up requests (asset id → request id) so they can
+    /// be cancelled on source rebuild / disappear.
+    @State private var liveWarmRequestIDs: [String: PHImageRequestID] = [:]
     private static let liveWarmAhead = 2     // upcoming Live Photos to pre-download
     private static let liveCacheCap = 5
     @State private var player: AVPlayer?
@@ -145,6 +161,8 @@ struct ContentView: View {
     @State private var showShareOptions = false
     @State private var showPreview = false
     @State private var previewImage: UIImage?
+    /// True while resolving share content (iCloud video / original image data).
+    @State private var isPreparingShare = false
 
     // MARK: UI layout
     private let cardWidth = UIScreen.main.bounds.width - 40
@@ -206,9 +224,13 @@ struct ContentView: View {
         activeCard = nil
 
         loadingIDs.insert(id)
-        cardImageRequestIDs[id] = loadCardState(for: asset) { card in
+        cardImageRequestIDs[id] = loadCardState(for: asset, onFailure: {
+            self.handleCardLoadFailure(for: asset, revision: revision)
+        }) { card in
             DispatchQueue.main.async {
                 guard revision == self.sourceRevision else { return }
+                // A late delivery must not resurrect an asset already swiped away.
+                guard !self.sessionProcessed.contains(id) else { return }
                 let isFirstDelivery = (self.loadingIDs.remove(id) != nil)
                 // A late full-res delivery must not overwrite a card the user has
                 // already swiped to during the degraded→full window.
@@ -224,7 +246,11 @@ struct ContentView: View {
     }
 
 
-    private let imageManager = PHCachingImageManager()
+    /// One app-lifetime caching manager. ContentView is a struct SwiftUI keeps
+    /// recreating, so a per-instance manager would lose its warm cache and make
+    /// saved request IDs un-cancelable on the new instance.
+    private static let sharedImageManager = PHCachingImageManager()
+    private var imageManager: PHCachingImageManager { Self.sharedImageManager }
 
     // MARK: - NEW: lightweight animated coach hints (non-blocking)
     @AppStorage("hint_today_banner_seen") private var hintTodayBannerSeen = false
@@ -233,13 +259,15 @@ struct ContentView: View {
 
     @State private var showTopBanner: Bool = false
     @State private var bannerTextKey: LocalizedStringKey = "hint.banner.today"
+    /// Cancellable auto-dismiss for the top banner, so a new banner restarts the timer.
+    @State private var bannerDismissWork: DispatchWorkItem?
 
     private var hasTodayCards: Bool {
         activeCard != nil || !buffer.isEmpty || !loadingIDs.isEmpty
     }
 
     private var shouldShowStageEmptyState: Bool {
-        !isSourceLoading && activeCard == nil && buffer.isEmpty && loadingIDs.isEmpty
+        !isSourceLoading && !isPickingRandomDay && activeCard == nil && buffer.isEmpty && loadingIDs.isEmpty
     }
 
     /// True when a free user has used up today's quota
@@ -252,7 +280,7 @@ struct ContentView: View {
     }
 
     private var shouldShowStageLoadingState: Bool {
-        isSourceLoading || (activeCard == nil && buffer.isEmpty && !loadingIDs.isEmpty)
+        isSourceLoading || isPickingRandomDay || (activeCard == nil && buffer.isEmpty && !loadingIDs.isEmpty)
     }
 
     private var shouldShowGestureHint: Bool {
@@ -329,7 +357,7 @@ struct ContentView: View {
                     )
                     .opacity(shouldShowStageEmptyState && !shouldShowRandomContinueState ? 1 : 0)
 
-                    ProgressView()
+                    stageLoadingView
                         .opacity(shouldShowStageLoadingState ? 1 : 0)
 
                     if activeCard != nil || !buffer.isEmpty {
@@ -383,16 +411,47 @@ struct ContentView: View {
         .onAppear {
             buildTagCacheOnce()
             recomputePendingRelease()
-            rebuildCurrentSource {
+            if !hasLoadedOnce {
+                hasLoadedOnce = true
+                if dateSourceMode == .random && randomPickedDay == nil {
+                    // First launch default: land on a random historical day. Once a
+                    // day is picked this branch never runs again.
+                    randomButtonTapped()
+                } else {
+                    rebuildCurrentSource {
+                        recalcTodayPendingCountFast()
+                        bootstrapBuffer(force: true)
+                        refreshFilmstripSnapshot()
+                        presentTopBannerIfNeeded()
+                    }
+                }
+            } else {
+                // Re-appear (tab switch): tag cache was just rebuilt above, so drop
+                // cards marked elsewhere but keep loaded images — no force reload.
+                // photoLibraryDidChange → ReloadPhotos covers real library changes.
+                buffer.removeAll { !isUnmarkedTodayAsset($0.asset) }
+                if let cur = activeCard, !isUnmarkedTodayAsset(cur.asset) {
+                    activeCard = buffer.isEmpty ? nil : buffer.removeFirst()
+                    syncNoteForCurrent()
+                }
                 recalcTodayPendingCountFast()
-                bootstrapBuffer(force: true)
+                ensureBuffer()
                 refreshFilmstripSnapshot()
-                presentTopBannerIfNeeded()
             }
             storageStats.notePendingProgress(pendingReleaseBytes)
-            // Warm the first random day in the background so the initial "Random"
-            // tap is already fast and sharp.
+            // Warm the next random day in the background so re-rolling stays
+            // fast and sharp.
             prewarmNextRandomDay()
+            prefetchLibraryDateBounds()
+        }
+        .sheet(isPresented: $showMonthPicker) {
+            MonthPickerSheet(
+                bounds: cachedLibraryDateBounds,
+                initial: monthReference
+            ) { picked in
+                selectMonth(picked)
+            }
+            .presentationDetents([.height(320)])
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ReloadPhotos"))) { _ in
             refreshCurrentSourcePreservingSelection(showBanner: true)
@@ -403,6 +462,14 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             stopAllMedia()
+        }
+        // Midnight rollover: lift the free-quota wall and refresh "today"-anchored sources.
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name.NSCalendarDayChanged).receive(on: RunLoop.main)) { _ in
+            handleDayChange()
+        }
+        // Returning to the foreground may also cross midnight — re-check the quota.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            _ = paywallGate.checkQuota(isPremium: storeManager.hasUnlockedPremium)
         }
         .onChange(of: activeCard?.asset.localIdentifier) { _, _ in
             stopAllMedia()
@@ -426,6 +493,7 @@ struct ContentView: View {
         .onDisappear {
             stopAllMedia()
             cancelPendingImageRequests()
+            cancelLiveWarmRequests()
         }
         .alert("cleanup.auth.title".localized, isPresented: $showCleanupAuthAlert) {
             Button("cleanup.auth.settings".localized) { PhotoLibraryAuth.openSettings() }
@@ -465,9 +533,27 @@ struct ContentView: View {
     }
 
     private func showBannerFor(seconds: Double) {
+        bannerDismissWork?.cancel()
         withAnimation(.easeOut(duration: 0.2)) { showTopBanner = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+        let work = DispatchWorkItem {
             withAnimation(.easeOut(duration: 0.2)) { showTopBanner = false }
+        }
+        bannerDismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
+    private func hideBanner() {
+        bannerDismissWork?.cancel()
+        bannerDismissWork = nil
+        withAnimation(.easeOut(duration: 0.2)) { showTopBanner = false }
+    }
+
+    /// Midnight rollover: re-check the free quota (lifts the wall via the gate's
+    /// objectWillChange) and rebuild "now"-anchored sources.
+    private func handleDayChange() {
+        _ = paywallGate.checkQuota(isPremium: storeManager.hasUnlockedPremium)
+        if dateSourceMode == .today, todayScope == .day || todayScope == .week {
+            refreshCurrentSourcePreservingSelection()
         }
     }
 
@@ -626,6 +712,12 @@ struct ContentView: View {
     private func commitSwipeAndAdvance(status: String, from t: CGSize, predicted: CGSize) {
         guard !isUndoRestoring else { return }
         guard let card = activeCard else { return }
+        // Daily quota gate at the single commit entry (gesture, button and edge
+        // swipe all funnel through here). recordSwipe is a no-op for premium.
+        guard paywallGate.recordSwipe(isPremium: storeManager.hasUnlockedPremium) else {
+            if !paywallGate.showPaywall { paywallGate.showPaywall = true }
+            return
+        }
         isAnimatingOut = true
         settleOffset = t
 
@@ -670,10 +762,8 @@ struct ContentView: View {
                 self.storageStats.noteAsset(card.asset)
             }
 
-            // daily quota gate
-            self.paywallGate.recordSwipe(isPremium: self.storeManager.hasUnlockedPremium)
-
-            // Hard wall: the moment a free user uses up today's quota, auto-present
+            // Quota was recorded at commit entry. Hard wall: the moment a free
+            // user uses up today's quota, auto-present
             // the paywall sheet (the inline upgrade card stays as a fallback).
             if !self.storeManager.hasUnlockedPremium,
                self.paywallGate.isQuotaExhausted,
@@ -729,72 +819,83 @@ struct ContentView: View {
 
             HStack(spacing: 12) {
                 HStack(spacing: 8) {
+                    // Single source entry: pick Random day / Today / This week /
+                    // a specific month. Replaces the old separate scope + random pills.
                     Menu {
-                        Button("filter.today".localized) {
+                        Button {
+                            randomButtonTapped()
+                        } label: {
+                            Label("filter.random".localized, systemImage: "shuffle")
+                        }
+                        Button {
                             activateTodayScope(.day)
+                        } label: {
+                            Label("filter.today".localized, systemImage: "sun.max")
                         }
-                        Button("filter.week".localized) {
+                        Button {
                             activateTodayScope(.week)
+                        } label: {
+                            Label("filter.week".localized, systemImage: "calendar")
                         }
-                        Button("filter.month".localized) {
-                            activateTodayScope(.month)
+                        Button {
+                            prefetchLibraryDateBounds()
+                            showMonthPicker = true
+                        } label: {
+                            Label("filter.pick_month".localized, systemImage: "calendar.badge.clock")
                         }
                     } label: {
                         HStack(spacing: 6) {
-                            Text(currentTodayScopeLabel.localized)
+                            Image(systemName: currentSourceIcon)
+                            Text(currentSourceLabel)
+                                .lineLimit(1)
                             Image(systemName: "chevron.down")
                                 .font(.system(size: 10, weight: .semibold))
                         }
                         .font(.caption.weight(.semibold))
-                        .foregroundColor(dateSourceMode == .today ? .white : .primary)
+                        .foregroundColor(.white)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .background(dateSourceMode == .today ? Color.blue : Color.secondary.opacity(0.12))
+                        .background(Color.blue)
                         .clipShape(Capsule())
                     }
 
-                    Button(action: randomButtonTapped) {
-                        HStack(spacing: 6) {
-                            if isPickingRandomDay {
-                                ProgressView()
-                                    .controlSize(.mini)
-                            } else {
-                                Image(systemName: "shuffle")
-                                    .font(.caption.weight(.semibold))
-                            }
-                            Text(randomButtonLabel)
-                                .font(.caption.weight(.semibold))
-                                .lineLimit(1)
-                        }
-                        .foregroundColor(dateSourceMode == .random ? .white : .primary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(dateSourceMode == .random ? Color.blue : Color.secondary.opacity(0.12))
-                        .clipShape(Capsule())
+                    // Date next to the entry: day for day/random, the week's first
+                    // day for week, year-month for month.
+                    if let dateLabel = currentSourceDateLabel {
+                        Text(dateLabel)
+                            .font(.caption.weight(.medium))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .layoutPriority(-1)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(isPickingRandomDay)
+
+                    // One-tap re-roll, kept only in random mode so changing days
+                    // stays a single tap instead of reopening the menu.
+                    if dateSourceMode == .random {
+                        Button(action: randomButtonTapped) {
+                            Group {
+                                if isPickingRandomDay {
+                                    ProgressView()
+                                        .controlSize(.mini)
+                                } else {
+                                    Image(systemName: "shuffle")
+                                        .font(.caption.weight(.semibold))
+                                }
+                            }
+                            .foregroundColor(.primary)
+                            .frame(width: 30, height: 30)
+                            .background(Color.secondary.opacity(0.12))
+                            .clipShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isPickingRandomDay)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                // Daily quota indicator (free users only)
-                if !storeManager.hasUnlockedPremium {
-                    HStack(spacing: 4) {
-                        Text("\(paywallGate.usedToday)/\(paywallGate.dailyFreeLimit)")
-                            .font(.caption2.weight(.semibold).monospacedDigit())
-                        Image(systemName: "sparkles")
-                            .font(.system(size: 9, weight: .semibold))
-                    }
-                    .foregroundColor(paywallGate.isQuotaExhausted ? .orange : .secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        paywallGate.isQuotaExhausted
-                            ? Color.orange.opacity(0.12)
-                            : Color.secondary.opacity(0.10)
-                    )
-                    .clipShape(Capsule())
-                }
+                // Daily quota indicator removed from the header so it can't crowd
+                // the source date label. The quota itself is unchanged — the paywall
+                // still gates free users once the daily limit is reached.
 
                 Button(action: undoLastAction) {
                     Image(systemName: "arrow.uturn.backward.circle.fill")
@@ -809,14 +910,58 @@ struct ContentView: View {
         .transaction { $0.animation = nil }
     }
 
-    private var currentTodayScopeLabel: String {
-        switch todayScope {
-        case .day:
-            return "filter.today"
-        case .week:
-            return "filter.week"
-        case .month:
-            return "filter.month"
+    /// Name shown on the single source entry pill.
+    private var currentSourceLabel: String {
+        switch dateSourceMode {
+        case .random:
+            return "filter.random".localized
+        case .today:
+            switch todayScope {
+            case .day:   return "filter.today".localized
+            case .week:  return "filter.week".localized
+            case .month: return "filter.month".localized
+            }
+        }
+    }
+
+    /// SF Symbol shown on the source entry pill, matching the current mode.
+    private var currentSourceIcon: String {
+        switch dateSourceMode {
+        case .random:
+            return "shuffle"
+        case .today:
+            switch todayScope {
+            case .day:   return "sun.max"
+            case .week:  return "calendar"
+            case .month: return "calendar"
+            }
+        }
+    }
+
+    /// The date shown next to the entry: a day for day/random, the week's first
+    /// day for week, and the year-month for month. Nil when no day is picked yet.
+    private var currentSourceDateLabel: String? {
+        switch dateSourceMode {
+        case .random:
+            guard let day = randomPickedDay else { return nil }
+            return formattedDay(day)
+        case .today:
+            switch todayScope {
+            case .day:   return formattedDay(Date())
+            case .week:  return formattedDay(selectedSourceInterval.start)
+            case .month: return formattedMonth(monthReference)
+            }
+        }
+    }
+
+    /// Friendly loading placeholder shown while a source switch / random pick
+    /// prepares its first sharp card.
+    private var stageLoadingView: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+            Text("loading.preparing".localized)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
         }
     }
 
@@ -825,6 +970,11 @@ struct ContentView: View {
         guard !isAnimatingOut else { return }
         guard !isUndoRestoring else { return }
         guard activeCard != nil else { return }
+        // Quota wall: buttons must not bypass the daily free limit.
+        if quotaExhaustedForFreeUser {
+            paywallGate.showPaywall = true
+            return
+        }
         if isZoomingImage { resetImageZoom() }
 
         // ✅ NEW: using buttons also counts as "user learned gestures"
@@ -998,6 +1148,9 @@ struct ContentView: View {
                             try? modelContext.save()
 
                             for id in idSet { tagCache.removeValue(forKey: id) }
+                            // Physically deleted assets can no longer be undone —
+                            // drop them so undo can't write tags for dead assets.
+                            undoStack.removeAll { idSet.contains($0) }
                             redCount = 0   // every delete-marked asset was just removed
 
                             storageStats.recordCleanup(bytes: bytes)
@@ -1019,11 +1172,12 @@ struct ContentView: View {
         if force {
             sourceRevision += 1
             cancelPendingImageRequests()
+            cancelLiveWarmRequests()
             stopAllMedia()
             buffer.removeAll()
             loadingIDs.removeAll()
+            cardLoadRetryCounts.removeAll()
             livePhotoCache.removeAll()
-            liveWarmInFlight.removeAll()
             activeCard = nil
             settleOffset = .zero
             todayCursor = 0
@@ -1045,9 +1199,13 @@ struct ContentView: View {
         todayCursor = firstIndex + 1
         loadingIDs.insert(id)
 
-        cardImageRequestIDs[id] = loadCardState(for: firstAsset) { card in
+        cardImageRequestIDs[id] = loadCardState(for: firstAsset, highQuality: true, onFailure: {
+            self.handleCardLoadFailure(for: firstAsset, revision: revision)
+        }) { card in
             DispatchQueue.main.async {
                 guard revision == self.sourceRevision else { return }
+                // A late delivery must not resurrect an asset already swiped away.
+                guard !self.sessionProcessed.contains(id) else { return }
                 let isFirstDelivery = (self.loadingIDs.remove(id) != nil)
                 // A late full-res delivery must not overwrite a card the user has
                 // already swiped to during the degraded→full window.
@@ -1066,7 +1224,9 @@ struct ContentView: View {
         let calendar = Calendar.current
         switch dateSourceMode {
         case .today:
-            return interval(for: todayScope, referenceDate: Date(), calendar: calendar)
+            // Day/week track "now"; month browses whichever month was picked.
+            let reference = (todayScope == .month) ? monthReference : Date()
+            return interval(for: todayScope, referenceDate: reference, calendar: calendar)
         case .random:
             let day = randomPickedDay ?? Date()
             let start = calendar.startOfDay(for: day)
@@ -1173,6 +1333,18 @@ struct ContentView: View {
         }
     }
 
+    /// Prefetch the library date bounds off-main and cache them, so the month
+    /// picker sheet never runs synchronous Photos fetches on the main thread.
+    private func prefetchLibraryDateBounds() {
+        guard cachedLibraryDateBounds == nil else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let bounds = fetchLibraryDateBounds() else { return }
+            DispatchQueue.main.async {
+                if cachedLibraryDateBounds == nil { cachedLibraryDateBounds = bounds }
+            }
+        }
+    }
+
     private func fetchLibraryDateBounds() -> (oldest: Date, newest: Date)? {
         let oldestOpt = PHFetchOptions()
         oldestOpt.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
@@ -1264,16 +1436,48 @@ struct ContentView: View {
     }
 
     private func activateTodayScope(_ scope: TodayScope) {
-        if dateSourceMode != .today {
+        // Invalidate any in-flight random pick so its late callback can't
+        // override the source the user just switched to.
+        randomPickToken += 1
+        isPickingRandomDay = false
+        let modeChanged = dateSourceMode != .today
+        if modeChanged {
             dateSourceMode = .today
             randomPickedDay = nil
+        }
+        if modeChanged && todayScope == scope {
+            // Scope unchanged but the mode did — still needs a rebuild.
+            rebuildCurrentSource {
+                recalcTodayPendingCountFast()
+                bootstrapBuffer(force: true)
+                presentTopBannerIfNeeded()
+            }
+            return
         }
         switchTodayScope(scope)
     }
 
     private func switchTodayScope(_ scope: TodayScope) {
         guard todayScope != scope else { return }
+        randomPickToken += 1
+        isPickingRandomDay = false
         todayScope = scope
+        rebuildCurrentSource {
+            recalcTodayPendingCountFast()
+            bootstrapBuffer(force: true)
+            presentTopBannerIfNeeded()
+        }
+    }
+
+    /// Jump to a specific historical month. Always rebuilds, even if the month
+    /// scope is already active, because the reference month changed.
+    private func selectMonth(_ month: Date) {
+        randomPickToken += 1
+        isPickingRandomDay = false
+        monthReference = month
+        dateSourceMode = .today
+        randomPickedDay = nil
+        todayScope = .month
         rebuildCurrentSource {
             recalcTodayPendingCountFast()
             bootstrapBuffer(force: true)
@@ -1406,19 +1610,28 @@ struct ContentView: View {
         }
     }
 
-    private func formattedDay(_ day: Date) -> String {
+    // Cached formatters: DateFormatter init is expensive and these run per frame.
+    private static let dayDisplayFormatter: DateFormatter = {
         let df = DateFormatter()
         df.locale = .current
         df.dateStyle = .medium
         df.timeStyle = .none
-        return df.string(from: day)
+        return df
+    }()
+
+    private static let monthDisplayFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.locale = .current
+        df.setLocalizedDateFormatFromTemplate("yMMMM")
+        return df
+    }()
+
+    private func formattedDay(_ day: Date) -> String {
+        Self.dayDisplayFormatter.string(from: day)
     }
 
-    private var randomButtonLabel: String {
-        if let d = randomPickedDay {
-            return "filter.random_date".localized(with: formattedDay(d))
-        }
-        return "filter.random".localized
+    private func formattedMonth(_ date: Date) -> String {
+        Self.monthDisplayFormatter.string(from: date)
     }
 
     private var randomContinueEmptyState: some View {
@@ -1509,7 +1722,9 @@ struct ContentView: View {
 
             loadingIDs.insert(id)
 
-            cardImageRequestIDs[id] = loadCardState(for: asset) { card in
+            cardImageRequestIDs[id] = loadCardState(for: asset, onFailure: {
+                self.handleCardLoadFailure(for: asset, revision: revision)
+            }) { card in
                 DispatchQueue.main.async {
                     guard revision == self.sourceRevision else { return }
 
@@ -1552,15 +1767,19 @@ struct ContentView: View {
 
     // MARK: - Image Loading
     @discardableResult
-    private func loadCardState(for asset: PHAsset, completion: @escaping (CardState) -> Void) -> PHImageRequestID {
+    private func loadCardState(for asset: PHAsset, highQuality: Bool = false, onFailure: (() -> Void)? = nil, completion: @escaping (CardState) -> Void) -> PHImageRequestID {
         let scale = UIScreen.main.scale
         let target = CGSize(width: cardWidth * scale, height: cardHeight * scale)
 
         let opt = PHImageRequestOptions()
         opt.isNetworkAccessAllowed = true
-        opt.deliveryMode = .opportunistic
+        // The first card after a source switch loads at full quality so the user
+        // lands on a sharp image (behind the loading spinner) instead of the
+        // opportunistic degraded→full blur flash. Buffered cards keep opportunistic.
+        opt.deliveryMode = highQuality ? .highQualityFormat : .opportunistic
         opt.resizeMode = .fast
 
+        let assetID = asset.localIdentifier
         return imageManager.requestImage(
             for: asset,
             targetSize: target,
@@ -1568,8 +1787,52 @@ struct ContentView: View {
             options: opt
         ) { img, info in
             if let cancelled = info?[PHImageCancelledKey] as? Bool, cancelled { return }
-            guard let img else { return }
-            completion(CardState(asset: asset, image: img))
+            let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            if !isDegraded {
+                // Final delivery: drop the saved request id (if it's still ours).
+                let reqID = (info?[PHImageResultRequestIDKey] as? NSNumber)?.int32Value
+                DispatchQueue.main.async {
+                    if let reqID, self.cardImageRequestIDs[assetID] == reqID {
+                        self.cardImageRequestIDs.removeValue(forKey: assetID)
+                    }
+                    if img != nil { self.cardLoadRetryCounts.removeValue(forKey: assetID) }
+                }
+            }
+            if let img {
+                completion(CardState(asset: asset, image: img))
+            } else if !isDegraded {
+                // Final delivery without an image = real failure (e.g. iCloud
+                // on bad network). Degraded interim callbacks never end up here.
+                onFailure?()
+            }
+        }
+    }
+
+    /// A card image load failed on its final delivery. Clear the loading marker
+    /// so the spinner can end, retry a couple of times, then skip the asset.
+    private func handleCardLoadFailure(for asset: PHAsset, revision: Int) {
+        DispatchQueue.main.async {
+            guard revision == self.sourceRevision else { return }
+            let id = asset.localIdentifier
+            self.cardImageRequestIDs.removeValue(forKey: id)
+            guard self.loadingIDs.remove(id) != nil else { return }
+
+            let attempts = self.cardLoadRetryCounts[id, default: 0]
+            if attempts < Self.cardLoadMaxRetries {
+                self.cardLoadRetryCounts[id] = attempts + 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    guard revision == self.sourceRevision else { return }
+                    // Rewind the cursor so ensureBuffer re-requests this asset.
+                    if let order = self.todayOrderByID[id] {
+                        self.todayCursor = min(self.todayCursor, order)
+                    }
+                    self.ensureBuffer()
+                }
+            } else {
+                // Give up on this asset and move on so the stack keeps flowing.
+                self.cardLoadRetryCounts.removeValue(forKey: id)
+                self.ensureBuffer()
+            }
         }
     }
 
@@ -1651,6 +1914,8 @@ struct ContentView: View {
     /// Pre-download full Live Photos for the next cards in the buffer so that by
     /// the time the user swipes to one, it's ready to play with no spinner.
     private func warmUpcomingLivePhotos() {
+        // Speculative prefetch must honor the user's network preference.
+        guard prefetchAllowedNow else { return }
         let upcoming = buffer.prefix(6).map(\.asset)
             .filter { $0.mediaSubtypes.contains(.photoLive) }
         var warmed = 0
@@ -1667,16 +1932,26 @@ struct ContentView: View {
             let scale = UIScreen.main.scale
             let target = CGSize(width: cardWidth * scale, height: cardHeight * scale)
 
-            PHImageManager.default().requestLivePhoto(
+            liveWarmRequestIDs[id] = PHImageManager.default().requestLivePhoto(
                 for: asset, targetSize: target, contentMode: .aspectFit, options: opt
             ) { live, _ in
                 DispatchQueue.main.async {
                     self.liveWarmInFlight.remove(id)
+                    self.liveWarmRequestIDs.removeValue(forKey: id)
                     guard let live else { return }
                     self.cacheLivePhoto(live, for: id)
                 }
             }
         }
+    }
+
+    /// Cancel all in-flight Live Photo warm-ups (source rebuild / disappear).
+    private func cancelLiveWarmRequests() {
+        for reqID in liveWarmRequestIDs.values {
+            PHImageManager.default().cancelImageRequest(reqID)
+        }
+        liveWarmRequestIDs.removeAll()
+        liveWarmInFlight.removeAll()
     }
 
     private func cacheLivePhoto(_ live: PHLivePhoto, for id: String) {
@@ -1685,9 +1960,15 @@ struct ContentView: View {
         // Evict entries no longer near the current position.
         let keep = Set([activeCard?.asset.localIdentifier].compactMap { $0 }
                        + buffer.map(\.asset.localIdentifier))
-        for k in livePhotoCache.keys where !keep.contains(k) {
+        for k in Array(livePhotoCache.keys) where !keep.contains(k) {
             livePhotoCache.removeValue(forKey: k)
-            if livePhotoCache.count <= Self.liveCacheCap { break }
+            if livePhotoCache.count <= Self.liveCacheCap { return }
+        }
+        // Still over cap (everything left is "keep"): force-evict anything but
+        // the freshly cached entry so the cache can't grow unbounded.
+        for k in Array(livePhotoCache.keys) where k != id {
+            livePhotoCache.removeValue(forKey: k)
+            if livePhotoCache.count <= Self.liveCacheCap { return }
         }
     }
 
@@ -1987,11 +2268,23 @@ struct ContentView: View {
         guard let asset = activeCard?.asset else { return }
 
         if asset.mediaType == .video {
+            guard !isPreparingShare else { return }
+            beginSharePreparation()
             let opt = PHVideoRequestOptions()
             opt.isNetworkAccessAllowed = true
             PHImageManager.default().requestAVAsset(forVideo: asset, options: opt) { av, _, _ in
-                guard let url = (av as? AVURLAsset)?.url else { return }
-                DispatchQueue.main.async { self.presentShareSheet(items: [url]) }
+                DispatchQueue.main.async {
+                    if let url = (av as? AVURLAsset)?.url {
+                        self.finishSharePreparation()
+                        self.presentShareSheet(items: [url])
+                    } else if av != nil {
+                        // AVComposition (slo-mo etc.) has no file URL — export the
+                        // original video resource to a temp file instead.
+                        self.exportVideoResourceAndShare(asset: asset)
+                    } else {
+                        self.failSharePreparation()
+                    }
+                }
             }
         } else {
             // 图片：弹出分享选项
@@ -1999,13 +2292,74 @@ struct ContentView: View {
         }
     }
 
-    private func presentShareSheet(items: [Any]) {
-        let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
-        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let root = scene.windows.first?.rootViewController {
-            root.present(vc, animated: true)
+    /// Slo-mo / edited videos come back as AVComposition. Write the underlying
+    /// video resource to a temp file so the share sheet gets a real URL.
+    private func exportVideoResourceAndShare(asset: PHAsset) {
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard let resource = resources.first(where: { $0.type == .fullSizeVideo })
+                ?? resources.first(where: { $0.type == .video }) else {
+            failSharePreparation()
+            return
         }
-        
+        var ext = (resource.originalFilename as NSString).pathExtension
+        if ext.isEmpty { ext = "mov" }
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(ext)
+        let opt = PHAssetResourceRequestOptions()
+        opt.isNetworkAccessAllowed = true
+        PHAssetResourceManager.default().writeData(for: resource, toFile: tempURL, options: opt) { error in
+            DispatchQueue.main.async {
+                if error == nil {
+                    self.finishSharePreparation()
+                    self.presentShareSheet(items: [tempURL])
+                } else {
+                    self.failSharePreparation()
+                }
+            }
+        }
+    }
+
+    private func beginSharePreparation() {
+        isPreparingShare = true
+        bannerTextKey = "share.preparing"
+        showBannerFor(seconds: 30)   // safety net; dismissed on finish/fail
+    }
+
+    private func finishSharePreparation() {
+        isPreparingShare = false
+        hideBanner()
+    }
+
+    private func failSharePreparation() {
+        isPreparingShare = false
+        bannerTextKey = "share.failed"
+        showBannerFor(seconds: 3)
+    }
+
+    private func presentShareSheet(items: [Any]) {
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+        guard let window = scene?.keyWindow ?? scene?.windows.first else { return }
+
+        // Present on the top-most presented controller, not the root.
+        var presenter = window.rootViewController
+        while let presented = presenter?.presentedViewController {
+            presenter = presented
+        }
+        guard let presenter else { return }
+
+        let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        // iPad requires a popover anchor or it crashes on presentation.
+        if let popover = vc.popoverPresentationController {
+            popover.sourceView = presenter.view
+            popover.sourceRect = CGRect(x: presenter.view.bounds.midX,
+                                        y: presenter.view.bounds.midY,
+                                        width: 1, height: 1)
+            popover.permittedArrowDirections = []
+        }
+        presenter.present(vc, animated: true)
     }
     private var shareOptionsOverlay: some View {
         ZStack {
@@ -2125,16 +2479,48 @@ struct ContentView: View {
     }
     private func shareOriginalImage() {
         showShareOptions = false
-        guard let image = activeCard?.image else { return }
-        presentShareSheet(items: [image])
+        guard let asset = activeCard?.asset else { return }
+        guard !isPreparingShare else { return }
+        beginSharePreparation()
+
+        let opt = PHImageRequestOptions()
+        opt.isNetworkAccessAllowed = true
+        opt.deliveryMode = .highQualityFormat
+        // Original image data (full resolution + EXIF), not the card thumbnail.
+        PHImageManager.default().requestImageDataAndOrientation(for: asset, options: opt) { data, uti, _, _ in
+            guard let data else {
+                DispatchQueue.main.async { self.failSharePreparation() }
+                return
+            }
+            // Write to a temp file off-main so the share sheet offers a real
+            // image file with its metadata intact.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let ext = uti.flatMap { UTType($0)?.preferredFilenameExtension } ?? "jpg"
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString)
+                    .appendingPathExtension(ext)
+                do {
+                    try data.write(to: url)
+                    DispatchQueue.main.async {
+                        self.finishSharePreparation()
+                        self.presentShareSheet(items: [url])
+                    }
+                } catch {
+                    DispatchQueue.main.async { self.failSharePreparation() }
+                }
+            }
+        }
     }
 
     private func shareImageWithNote() {
         showShareOptions = false
-        guard let image = activeCard?.image,
-              let note = tagCache[activeCard?.asset.localIdentifier ?? ""]?.note,
+        guard let image = activeCard?.image else {
+            failSharePreparation()
+            return
+        }
+        guard let note = tagCache[activeCard?.asset.localIdentifier ?? ""]?.note,
               !note.isEmpty else {
-            presentShareSheet(items: [activeCard?.image ?? UIImage()])
+            presentShareSheet(items: [image])
             return
         }
 
@@ -2283,24 +2669,6 @@ struct ContentView: View {
         guard let lastAssetID = undoStack.popLast() else { return }
         isUndoRestoring = true
 
-        sessionProcessed.remove(lastAssetID)
-
-        upsertTag(assetID: lastAssetID) { tag in
-            tag.status = "pending"
-            tag.createdAt = Date()
-        }
-
-        todayPendingCount += 1
-        writeWidgetCountDebounced(todayPendingCount)
-
-        sourceRevision += 1
-        let revision = sourceRevision
-        cancelPendingImageRequests()
-        // 也取消正在进行的视频请求，避免旧回调干扰
-        cancelCurrentVideoRequests()
-        videoCloudProgress = nil
-        loadingIDs.removeAll()
-
         // PHAsset.fetchAssets is synchronous Photos I/O — running it on the main
         // thread made every undo tap visibly stutter. Resolve it on a background
         // queue, then hop back to main for all UI/state work.
@@ -2308,29 +2676,50 @@ struct ContentView: View {
             let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [lastAssetID], options: nil)
             let asset = fetch.firstObject
             DispatchQueue.main.async {
-                // The source may have been rebuilt (newer revision) while we were
-                // fetching; bail if this undo is stale (and clear the in-flight
-                // flag so the undo button doesn't get stuck disabled).
                 guard self.isUndoRestoring else { return }
-                guard revision == self.sourceRevision else {
+                // Verify the asset still exists BEFORE writing any tag — it may
+                // have been physically deleted in the meantime.
+                guard let asset else {
+                    self.bannerTextKey = "undo.failed.deleted"
+                    self.showBannerFor(seconds: 3)
                     self.isUndoRestoring = false
                     return
                 }
+
+                self.sessionProcessed.remove(lastAssetID)
+                self.upsertTag(assetID: lastAssetID) { tag in
+                    tag.status = "pending"
+                    tag.createdAt = Date()
+                }
+
+                // The undone asset may belong to a previous source (e.g. an
+                // earlier random day). Only restore it on stage — and count it —
+                // when it's part of the current source.
+                guard self.todayOrderByID[lastAssetID] != nil else {
+                    self.bannerTextKey = "undo.restored.other"
+                    self.showBannerFor(seconds: 3)
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    self.isUndoRestoring = false
+                    return
+                }
+
+                self.todayPendingCount += 1
+                self.writeWidgetCountDebounced(self.todayPendingCount)
+
+                self.sourceRevision += 1
+                let revision = self.sourceRevision
+                self.cancelPendingImageRequests()
+                // 也取消正在进行的视频请求，避免旧回调干扰
+                self.cancelCurrentVideoRequests()
+                self.videoCloudProgress = nil
+                self.loadingIDs.removeAll()
+
                 self.continueUndo(asset: asset, revision: revision)
             }
         }
     }
 
-    private func continueUndo(asset: PHAsset?, revision: Int) {
-        guard let asset else {
-            rebuildCurrentSource {
-                recalcTodayPendingCountFast()
-                bootstrapBuffer(force: true)
-                isUndoRestoring = false
-            }
-            return
-        }
-
+    private func continueUndo(asset: PHAsset, revision: Int) {
         // 超时保护：3 秒内 completion 没回来就强制恢复
         let undoTimeout = DispatchWorkItem { [self] in
             guard self.isUndoRestoring else { return }
@@ -2342,6 +2731,10 @@ struct ContentView: View {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: undoTimeout)
 
+        // .opportunistic delivers degraded then full-res. One-time side effects
+        // (media stop, zoom reset, haptics) must only run on the first delivery;
+        // the upgrade just swaps the image in place.
+        var isFirstDelivery = true
         loadCardState(for: asset) { card in
             DispatchQueue.main.async {
                 undoTimeout.cancel()
@@ -2349,11 +2742,19 @@ struct ContentView: View {
                     self.isUndoRestoring = false
                     return
                 }
+                let restoredID = card.asset.localIdentifier
+                guard isFirstDelivery else {
+                    if self.activeCard?.asset.localIdentifier == restoredID {
+                        self.activeCard = card
+                    }
+                    return
+                }
+                isFirstDelivery = false
+
                 self.stopAllMedia()
                 self.resetImageZoom()
                 self.settleOffset = .zero
 
-                let restoredID = card.asset.localIdentifier
                 self.buffer.removeAll { $0.asset.localIdentifier == restoredID }
 
                 if let cur = self.activeCard {
@@ -2543,6 +2944,105 @@ private struct TodayGestureHintView: View {
         .onAppear {
             x = 36
             y = -10
+        }
+    }
+}
+
+// MARK: - Month picker (browse any historical month)
+/// Two-wheel year + month picker, constrained to the library's date range so the
+/// user can only pick months that could actually contain photos.
+private struct MonthPickerSheet: View {
+    let bounds: (oldest: Date, newest: Date)?
+    let initial: Date
+    let onPick: (Date) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    private let calendar = Calendar.current
+
+    @State private var year: Int
+    @State private var month: Int
+
+    init(bounds: (oldest: Date, newest: Date)?, initial: Date, onPick: @escaping (Date) -> Void) {
+        self.bounds = bounds
+        self.initial = initial
+        self.onPick = onPick
+        let cal = Calendar.current
+        _year = State(initialValue: cal.component(.year, from: initial))
+        _month = State(initialValue: cal.component(.month, from: initial))
+    }
+
+    private var years: [Int] {
+        let currentYear = calendar.component(.year, from: initial)
+        guard let bounds else { return Array((currentYear - 20)...currentYear) }
+        let lo = calendar.component(.year, from: bounds.oldest)
+        let hi = calendar.component(.year, from: bounds.newest)
+        return Array(lo...max(lo, hi))
+    }
+
+    /// Months selectable in the chosen year, clamped to the library range so the
+    /// edges (oldest / newest year) don't offer empty months.
+    private var selectableMonths: [Int] {
+        var lo = 1, hi = 12
+        if let bounds {
+            if year == calendar.component(.year, from: bounds.oldest) {
+                lo = calendar.component(.month, from: bounds.oldest)
+            }
+            if year == calendar.component(.year, from: bounds.newest) {
+                hi = calendar.component(.month, from: bounds.newest)
+            }
+        }
+        guard lo <= hi else { return Array(1...12) }
+        return Array(lo...hi)
+    }
+
+    private func monthName(_ m: Int) -> String {
+        let df = DateFormatter()
+        df.locale = .current
+        let symbols = df.standaloneMonthSymbols ?? []
+        return (m >= 1 && m <= symbols.count) ? symbols[m - 1] : "\(m)"
+    }
+
+    var body: some View {
+        NavigationStack {
+            HStack(spacing: 0) {
+                Picker("", selection: $year) {
+                    ForEach(years, id: \.self) { Text(String($0)).tag($0) }
+                }
+                .pickerStyle(.wheel)
+                .frame(maxWidth: .infinity)
+
+                Picker("", selection: $month) {
+                    ForEach(selectableMonths, id: \.self) { Text(monthName($0)).tag($0) }
+                }
+                .pickerStyle(.wheel)
+                .frame(maxWidth: .infinity)
+            }
+            .padding(.horizontal)
+            .navigationTitle("filter.pick_month".localized)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("common.cancel".localized) { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("common.done".localized) {
+                        var comp = DateComponents()
+                        comp.year = year
+                        comp.month = month
+                        comp.day = 1
+                        if let picked = calendar.date(from: comp) {
+                            onPick(picked)
+                        }
+                        dismiss()
+                    }
+                }
+            }
+            .onChange(of: year) { _, _ in
+                // Keep the month valid when switching to an edge year.
+                if !selectableMonths.contains(month) {
+                    month = selectableMonths.first ?? month
+                }
+            }
         }
     }
 }

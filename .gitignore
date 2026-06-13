@@ -2,3 +2,4 @@
 .derivedData/
 DerivedData/
 build/
+.claude/settings.local.json

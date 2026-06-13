@@ -53,9 +53,16 @@ final class PHAssetThumbnailLoader {
         }
 
         let options = PHImageRequestOptions()
-        // Grid scrolling should never trigger iCloud downloads — local thumbnails are sufficient
-        options.isNetworkAccessAllowed = false
-        options.deliveryMode = .fastFormat
+        // .opportunistic: a (possibly degraded) local thumbnail is delivered
+        // immediately, then the final non-degraded image follows — which is the
+        // only result we cache, so the cache actually gets populated.
+        // (.fastFormat alone mostly returned degraded results, so the cache hit
+        // rate was ~0 and every scroll re-requested everything.)
+        options.deliveryMode = .opportunistic
+        // iCloud-offloaded assets have no local thumbnail at all; without
+        // network access they would stay blank forever. The download here is
+        // thumbnail-sized, not the full original.
+        options.isNetworkAccessAllowed = true
         options.resizeMode = .fast
         options.isSynchronous = false
 
@@ -66,13 +73,18 @@ final class PHAssetThumbnailLoader {
             options: options
         ) { [weak self] image, info in
             guard let image else {
-                completion(nil, false)
+                // Intermediate callbacks can be image-less; only report failure
+                // for the final (non-degraded) delivery.
+                let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                if !degraded {
+                    completion(nil, false)
+                }
                 return
             }
 
             let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
 
-            // ✅ 关键：degraded 也先给 UI 显示，避免模拟器永远空白
+            // ✅ 关键：degraded 也先给 UI 显示，避免永远空白
             completion(image, degraded)
 
             // 只缓存“非 degraded”更稳（避免缓存糊图）

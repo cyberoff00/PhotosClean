@@ -18,6 +18,58 @@ struct SubscriptionView: View {
     @State private var selectedPackageID: String?
     @State private var hasInitialized = false
     @State private var showCancelSubAlert = false
+    /// Purchase / restore outcome surfaced to the user (nil = no alert).
+    @State private var purchaseAlert: PurchaseAlert?
+
+    /// User-visible outcomes of a purchase or restore attempt.
+    private enum PurchaseAlert: Identifiable {
+        /// Ask to Buy — the purchase is waiting for a guardian's approval.
+        case purchasePending
+        case purchaseFailed(String)
+        case restoreSuccess
+        case restoreNothing
+        case restoreFailed(String)
+
+        var id: String {
+            switch self {
+            case .purchasePending: return "purchasePending"
+            case .purchaseFailed: return "purchaseFailed"
+            case .restoreSuccess: return "restoreSuccess"
+            case .restoreNothing: return "restoreNothing"
+            case .restoreFailed: return "restoreFailed"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .purchasePending:
+                return String(localized: "sub.purchase.pending.title", defaultValue: "Purchase Pending Approval")
+            case .purchaseFailed:
+                return String(localized: "sub.purchase.failed.title", defaultValue: "Purchase Failed")
+            case .restoreSuccess:
+                return String(localized: "sub.restore.success.title", defaultValue: "Purchases Restored")
+            case .restoreNothing:
+                return String(localized: "sub.restore.none.title", defaultValue: "No Purchases to Restore")
+            case .restoreFailed:
+                return String(localized: "sub.restore.failed.title", defaultValue: "Restore Failed")
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .purchasePending:
+                return "sub.purchase.pending.message".localized
+            case .purchaseFailed(let detail):
+                return "sub.purchase.failed.message".localized(with: detail)
+            case .restoreSuccess:
+                return "sub.restore.success.message".localized
+            case .restoreNothing:
+                return "sub.restore.none.message".localized
+            case .restoreFailed(let detail):
+                return "sub.restore.failed.message".localized(with: detail)
+            }
+        }
+    }
 
     // MARK: - Package sorting
     private func sortPackages(_ packages: [Package]) -> [Package] {
@@ -121,6 +173,42 @@ struct SubscriptionView: View {
         } message: {
             Text("sub.lifetime.cancelsub.message")
         }
+        .alert(
+            purchaseAlert?.title ?? "",
+            isPresented: Binding(
+                get: { purchaseAlert != nil },
+                set: { if !$0 { purchaseAlert = nil } }
+            ),
+            presenting: purchaseAlert
+        ) { alert in
+            Button("common.ok") {
+                if case .restoreSuccess = alert { dismiss() }
+            }
+        } message: { alert in
+            Text(alert.message)
+        }
+    }
+
+    /// Maps a thrown purchase error to a user-facing alert.
+    /// - Cancellation: the user backed out on purpose — stay silent.
+    /// - Ask to Buy (`paymentPendingError`): explain that premium unlocks
+    ///   automatically once the purchase is approved.
+    /// - Anything else: generic failure with the underlying description.
+    private func handlePurchaseError(_ error: Error) {
+        let nsError = error as NSError
+        var code = error as? RevenueCat.ErrorCode
+        if code == nil, nsError.domain == RevenueCat.ErrorCode.errorDomain {
+            code = RevenueCat.ErrorCode(rawValue: nsError.code)
+        }
+
+        switch code {
+        case .purchaseCancelledError:
+            return
+        case .paymentPendingError:
+            purchaseAlert = .purchasePending
+        default:
+            purchaseAlert = .purchaseFailed(error.localizedDescription)
+        }
     }
 
     // MARK: - Lifetime owner (top tier — nothing left to purchase)
@@ -195,33 +283,36 @@ struct SubscriptionView: View {
     }
 
     // MARK: - Unsubscribed content
+    // Wrapped in a ScrollView so the plan list + CTA stay reachable on small
+    // screens (SE-class) where the full paywall doesn't fit the viewport.
     private var unsubscribedContent: some View {
-        VStack(spacing: 22) {
-            Text("🍪").font(.system(size: 70))
+        ScrollView(showsIndicators: false) {
+            VStack(spacing: 22) {
+                Text("🍪").font(.system(size: 70))
 
-            VStack(spacing: 8) {
-                Text("sub.title")
-                    .font(.title2.bold())
-                Text("sub.subtitle")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+                VStack(spacing: 8) {
+                    Text("sub.title")
+                        .font(.title2.bold())
+                    Text("sub.subtitle")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+
+                // Features
+                VStack(alignment: .leading, spacing: 15) {
+                    FeatureRow(icon: "infinity", textKey: "sub.feature.unlimited")
+                    FeatureRow(icon: "lock.shield", textKey: "sub.feature.privacy")
+                    FeatureRow(icon: "heart.fill", textKey: "sub.feature.indie")
+                }
+                .padding(.vertical, 6)
+
+                planSelector
+
+                bottomLegalLinks
             }
-
-            // Features
-            VStack(alignment: .leading, spacing: 15) {
-                FeatureRow(icon: "infinity", textKey: "sub.feature.unlimited")
-                FeatureRow(icon: "lock.shield", textKey: "sub.feature.privacy")
-                FeatureRow(icon: "heart.fill", textKey: "sub.feature.indie")
-            }
-            .padding(.vertical, 6)
-
-            Spacer()
-
-            planSelector
-
-            bottomLegalLinks
+            .padding(30)
+            .frame(maxWidth: .infinity)
         }
-        .padding(30)
     }
 
     // MARK: - Shared plan picker + purchase CTA
@@ -280,7 +371,7 @@ struct SubscriptionView: View {
                         dismiss()
                     }
                 } catch {
-                    print("Purchase failed: \(error)")
+                    handlePurchaseError(error)
                 }
             }
         } label: {
@@ -345,8 +436,17 @@ struct SubscriptionView: View {
 
                 Task {
                     defer { isRestoring = false }
-                    await storeManager.restore()
-                    if storeManager.hasUnlockedPremium { dismiss() }
+                    do {
+                        switch try await storeManager.restore() {
+                        case .restored:
+                            // Dismissed from the alert's OK button.
+                            purchaseAlert = .restoreSuccess
+                        case .nothingToRestore:
+                            purchaseAlert = .restoreNothing
+                        }
+                    } catch {
+                        purchaseAlert = .restoreFailed(error.localizedDescription)
+                    }
                 }
             } label: {
                 if isRestoring {

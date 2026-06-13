@@ -71,13 +71,6 @@
 "hint.banner.today.empty" = "今天没有新照片，随时去图库整理～";
 "hint.gesture.today" = "左右 / 上滑即可分类";
 
-/* ===== Tiny hints (one-line, no box) ===== */
-"hint.toast.undo" = "点这里撤销上一张";
-"hint.toast.note" = "可添加笔记，方便以后回忆";
-"tip.search" = "你可以为每张照片写备注，并在这里搜索";
-"tip.delete" = "将待删区照片从手机清除";
-"tip.swipe" = "快速清理历史照片";
-
 // Share
 "share.original" = "分享原图";
 "share.with.note" = "分享带笔记版本";
@@ -130,12 +123,6 @@
 "sub.title.subscribed" = "高级版本已激活";
 "sub.subtitle.subscribed" = "感谢您的支持！";
 
-// 订阅详情
-"sub.info.status" = "状态";
-"sub.info.active" = "已激活";
-"sub.info.plan" = "当前方案";
-"sub.info.renew" = "下次续订";
-
 // 订阅类型映射
 "sub.type.monthly" = "月付";
 "sub.type.quarterly" = "季付";
@@ -143,7 +130,6 @@
 
 // 操作
 "sub.manage.subscription" = "管理订阅";
-"sub.change.plan" = "更改方案";
 
 // 切换方案 / 升级（向活跃订阅用户展示）
 "sub.manage.subtitle" = "可随时切换方案或升级为终身版。";
@@ -160,6 +146,20 @@
 
 /* --- 通用 & 法律 --- */
 "sub.restore" = "恢复购买";
+
+// 购买结果提示
+"sub.purchase.pending.title" = "购买待批准";
+"sub.purchase.pending.message" = "你的购买正在等待批准（购买前询问）。批准后高级版会自动生效。";
+"sub.purchase.failed.title" = "购买失败";
+"sub.purchase.failed.message" = "购买未能完成，请稍后重试。\n（%@）";
+
+// 恢复购买结果提示
+"sub.restore.success.title" = "恢复成功";
+"sub.restore.success.message" = "已恢复你的高级版权益。";
+"sub.restore.none.title" = "没有可恢复的购买";
+"sub.restore.none.message" = "未找到可恢复的购买记录。请确认登录的是当初购买时使用的 Apple ID，或联系开发者获取帮助。";
+"sub.restore.failed.title" = "恢复失败";
+"sub.restore.failed.message" = "恢复购买未成功，请检查网络连接后重试。\n（%@）";
 
 // 加载失败
 "sub.load.failed.title" = "无法加载订阅方案";
@@ -188,8 +188,10 @@
 "filter.day" = "日";
 "filter.week" = "周";
 "filter.month" = "月";
-"filter.random" = "随机日期";
+"filter.random" = "随机一天";
 "filter.random_date" = "随机：%@";
+"filter.pick_month" = "选择月份";
+"loading.preparing" = "正在加载照片…";
 "random.empty.title" = "这一天已经刷完了";
 "random.empty.description" = "继续随机下一天，马上再来一组。";
 "random.empty.cta" = "再来一组";
@@ -197,6 +199,7 @@
 /* Common */
 "app.name" = "曲奇相片";
 "common.cancel" = "取消";
+"common.done" = "完成";
 "common.preview" = "预览";
 "common.share" = "分享";
 
@@ -286,3 +289,21 @@
 "feedback.send" = "发送";
 "feedback.nomail.title" = "未找到邮件应用";
 "feedback.nomail.message" = "请通过邮件联系我们：%@";
+
+/* Sharing */
+"share.preparing" = "正在准备分享…";
+"share.failed" = "分享准备失败，请重试";
+
+/* Undo */
+"undo.restored.other" = "已撤销，该照片不在当前视图中";
+"undo.failed.deleted" = "无法撤销，该照片已被删除";
+
+/* Photo access */
+"grid.photoAccess.deniedTitle" = "无法访问照片";
+"grid.photoAccess.deniedMessage" = "照片访问权限被拒绝或受限。请前往设置允许完全访问后再查看和清理照片。";
+
+/* Library */
+"library.card.loadFailed" = "无法加载此项目";
+"common.tapToRetry" = "点按重试";
+"library.limited.notice" = "应用目前仅能访问你选择的部分照片，统计数量可能不完整。";
+"library.limited.manage" = "管理所选照片";

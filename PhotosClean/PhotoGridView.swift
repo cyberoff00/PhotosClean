@@ -22,6 +22,14 @@ private struct CellFramePreferenceKey: PreferenceKey {
     }
 }
 
+/// Reference-type holder for cell frames. Writing frames into an @State dict
+/// would invalidate the body on every scroll frame while in selection mode;
+/// the drag-select hit testing only ever reads imperatively, so a plain class
+/// avoids that re-render churn entirely.
+private final class CellFrameStore {
+    var frames: [String: CGRect] = [:]
+}
+
 struct PhotoGridView: View {
     let title: String
     let filterStatus: String?
@@ -38,6 +46,12 @@ struct PhotoGridView: View {
     @State private var noteByAssetID: [String: String] = [:]
     @State private var statusByAssetID: [String: String] = [:]
     @State private var isLoading = true
+    // 首次加载后 pop 回来不再全库重抓；保留 30 秒节流以防外部相册变更长期不刷新。
+    @State private var hasLoadedOnce = false
+    @State private var lastLoadAt: Date? = nil
+    private static let reloadThrottleInterval: TimeInterval = 30
+    // 权限被拒/受限时显示“去设置”空状态
+    @State private var photoAccessDenied = false
     @State private var searchText = ""
     // searchText 经过 ~250ms debounce 后写入这里；过滤热路径只跟它走。
     @State private var debouncedSearchText = ""
@@ -81,7 +95,7 @@ struct PhotoGridView: View {
     // ✅ Batch add note (append with semicolons; keep existing notes)
     @State private var showingBatchNoteSheet = false
     @State private var batchNoteText = ""
-    @State private var cellFrames: [String: CGRect] = [:]
+    @State private var cellFrameStore = CellFrameStore()
     @State private var isDragSelecting = false
     @State private var dragAdds = true
     @State private var lastHitID: String?
@@ -103,6 +117,15 @@ struct PhotoGridView: View {
     private let blurCIContext = CIContext(options: nil)
     private let blurRenderColorSpace = CGColorSpaceCreateDeviceRGB()
 
+    // ✅ 待删除资产/体积缓存：只在 allTags / allAssetsSnapshot 变化时重算一次，
+    // body 渲染只读缓存（之前每次 body 都全库 O(N) 过滤 + 体积统计）。
+    @State private var pendingDeleteAssetsCache: [PHAsset] = []
+    @State private var pendingDeleteBytes: Int64 = 0
+    @State private var pendingDeleteAllPrecise = true
+
+    // ✅ 与 startPrefetching 配对的 stop：记录上一批已 start 的 assets
+    @State private var prefetchedAssets: [PHAsset] = []
+
     let columns = [
         GridItem(.flexible(), spacing: 2),
         GridItem(.flexible(), spacing: 2),
@@ -116,10 +139,22 @@ struct PhotoGridView: View {
         return title == libraryTitle
     }
 
+    // 待删除页不提供搜索/筛选：列表与"全部删除 (N)"始终一一对应，
+    // 避免"筛选后只见一部分、删除却是全部"的误解。
+    // filterStatus 在视图生命周期内不变，分支不会引起结构身份切换。
+    @ViewBuilder
+    private var searchableContentRoot: some View {
+        if filterStatus == "delete" {
+            contentRoot
+        } else {
+            contentRoot
+                .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always))
+        }
+    }
+
     var body: some View {
-        contentRoot
+        searchableContentRoot
             .navigationTitle(title)
-            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always))
             .toolbar { trailingToolbar }
             .alert("grid.photoAuth.title".localized, isPresented: $showingPhotoAuthAlert) {
                 Button("grid.cancel".localized, role: .cancel) {}
@@ -132,12 +167,22 @@ struct PhotoGridView: View {
                 rebuildTagMaps()
                 loadPhotos()
             }
+            .onDisappear {
+                stopPrefetchingThumbnails()
+            }
             .onChange(of: allTags) { _, _ in
                 rebuildTagMaps()
                 // applyStatusFilterFromSnapshot updates `assets` AND calls recomputeFilteredAssets
                 // in one shot, so we do NOT need a separate onChange(of: assets) listener.
                 applyStatusFilterFromSnapshot()
-                storageStats.precacheSizes(for: pendingDeleteAssets)
+                recomputePendingDeleteCache()
+                storageStats.precacheSizes(for: pendingDeleteAssetsCache)
+            }
+            // 精确体积是后台异步算出来的；节流刷新一次缓存的字节数即可。
+            .onReceive(storageStats.$preciseSizes.dropFirst().throttle(for: .milliseconds(300), scheduler: RunLoop.main, latest: true)) { _ in
+                guard filterStatus == "delete", !pendingDeleteAssetsCache.isEmpty else { return }
+                pendingDeleteBytes = storageStats.totalBestSize(for: pendingDeleteAssetsCache)
+                pendingDeleteAllPrecise = storageStats.allPrecise(for: pendingDeleteAssetsCache)
             }
             // Removed: onChange(of: assets) → was causing a second cascade since
             // applyStatusFilterFromSnapshot already mutates assets AND recomputes.
@@ -183,6 +228,17 @@ struct PhotoGridView: View {
         ScrollView {
             if isLoading {
                 ProgressView().padding(.top, 50)
+            } else if photoAccessDenied {
+                ContentUnavailableView {
+                    Label("grid.photoAccess.deniedTitle".localized, systemImage: "lock.shield")
+                } description: {
+                    Text("grid.photoAccess.deniedMessage".localized)
+                } actions: {
+                    Button("grid.photoAuth.openSettings".localized) {
+                        PhotoLibraryAuth.openSettings()
+                    }
+                }
+                .padding(.top, 50)
             } else if filteredAssets.isEmpty {
                 ContentUnavailableView(
                     "grid.noPhotos".localized,
@@ -209,7 +265,10 @@ struct PhotoGridView: View {
             gridScrollBody
                 .scrollDisabled(isDragSelecting)
                 .coordinateSpace(name: "gridSpace")
-                .onPreferenceChange(CellFramePreferenceKey.self) { cellFrames = $0 }
+                // 写入引用类型 holder，不触发 body 重算（滚动时 frame 每帧都在变）。
+                .onPreferenceChange(CellFramePreferenceKey.self) { [cellFrameStore] frames in
+                    cellFrameStore.frames = frames
+                }
                 .simultaneousGesture(dragSelectGesture(outerGeo: outerGeo))
                 .onReceive(autoScrollTimer) { _ in
                     guard isDragSelecting, autoScrollDirection != 0 else { return }
@@ -404,11 +463,11 @@ struct PhotoGridView: View {
     }
 
     private var deleteMenuButton: some View {
-        let deleteAssets = pendingDeleteAssets
-        let deleteCount = deleteAssets.count
-        let pendingBytes = storageStats.totalBestSize(for: deleteAssets)
-        let approxPrefix = storageStats.allPrecise(for: deleteAssets) ? "" : "~"
-        let sizeLabel = deleteCount > 0 ? " · \(approxPrefix)\(pendingBytes.byteCountShort)" : ""
+        // 只读缓存：pendingDeleteAssetsCache 在 allTags / allAssetsSnapshot 变化时
+        // 重算一次，体积随 preciseSizes 节流刷新，避免每次 body 全库过滤+统计。
+        let deleteCount = pendingDeleteAssetsCache.count
+        let approxPrefix = pendingDeleteAllPrecise ? "" : "~"
+        let sizeLabel = deleteCount > 0 ? " · \(approxPrefix)\(pendingDeleteBytes.byteCountShort)" : ""
         return Menu {
             Button(role: .destructive) {
                 // No app-level confirm: iOS presents its own "Delete N Photos?"
@@ -426,11 +485,26 @@ struct PhotoGridView: View {
         .disabled(deleteCount == 0)
     }
 
-    /// PHAssets currently marked for deletion (intersection of tags and known assets).
-    private var pendingDeleteAssets: [PHAsset] {
-        let deleteIDs = Set(allTags.filter { $0.status == "delete" }.map { $0.assetID })
-        guard !deleteIDs.isEmpty else { return [] }
-        return allAssetsSnapshot.filter { deleteIDs.contains($0.localIdentifier) }
+    /// Recompute the pending-delete cache (intersection of tags and known assets).
+    /// Called when `allTags` changes or after a fresh `loadPhotos` snapshot —
+    /// never from `body`.
+    private func recomputePendingDeleteCache() {
+        // 用"每个资产最新一条标签"判定，而不是任意一条 delete 记录——
+        // 否则用户已改回保留的照片会被算进（并被"全部删除"误删）。
+        var latestDate: [String: Date] = [:]
+        var latestStatus: [String: String] = [:]
+        for tag in allTags {
+            if let d = latestDate[tag.assetID], tag.createdAt <= d { continue }
+            latestDate[tag.assetID] = tag.createdAt
+            latestStatus[tag.assetID] = tag.status
+        }
+        let deleteIDs = Set(latestStatus.lazy.filter { $0.value == "delete" }.map { $0.key })
+        let deleteAssets = deleteIDs.isEmpty
+            ? []
+            : allAssetsSnapshot.filter { deleteIDs.contains($0.localIdentifier) }
+        pendingDeleteAssetsCache = deleteAssets
+        pendingDeleteBytes = storageStats.totalBestSize(for: deleteAssets)
+        pendingDeleteAllPrecise = storageStats.allPrecise(for: deleteAssets)
     }
 
     private var batchNoteSheet: some View {
@@ -469,7 +543,8 @@ struct PhotoGridView: View {
     private func gridCell(for asset: PHAsset) -> some View {
         let id = asset.localIdentifier
         let note = noteByAssetID[id]
-        let matchesSearch = !searchText.isEmpty && (note?.localizedCaseInsensitiveContains(searchText) ?? false)
+        // 高亮与过滤统一走 debouncedSearchText，避免输入瞬间两者不同步。
+        let matchesSearch = !debouncedSearchText.isEmpty && (note?.localizedCaseInsensitiveContains(debouncedSearchText) ?? false)
 
         if isSelectionMode {
             // Selection mode: show border, checkmark, geometry tracking
@@ -542,7 +617,7 @@ struct PhotoGridView: View {
         pendingDragAddsOverride = nil
         dragMode = .undecided
         dragStartPoint = nil
-        cellFrames = [:]
+        cellFrameStore.frames = [:]
     }
 
     private func applyBatchNote() {
@@ -589,8 +664,8 @@ struct PhotoGridView: View {
     }
 
     private func hitTestID(at point: CGPoint) -> String? {
-        // cellFrames 是字典，不保证顺序；这里显式遍历即可（frame 不会重叠）
-        for (id, rect) in cellFrames {
+        // frames 是字典，不保证顺序；这里显式遍历即可（frame 不会重叠）
+        for (id, rect) in cellFrameStore.frames {
             if rect.contains(point) { return id }
         }
         return nil
@@ -671,10 +746,19 @@ struct PhotoGridView: View {
 
 
     private func prefetchInitialThumbnails() {
+        // 先和上一批配对 stop，避免 caching manager 里残留的 start 请求只增不减。
+        stopPrefetchingThumbnails()
         let batch = Array(filteredAssets.prefix(60))
         guard !batch.isEmpty else { return }
         let targetSize = gridThumbnailTargetSize()
         PHAssetThumbnailLoader.shared.startPrefetching(batch, targetSize: targetSize)
+        prefetchedAssets = batch
+    }
+
+    private func stopPrefetchingThumbnails() {
+        guard !prefetchedAssets.isEmpty else { return }
+        PHAssetThumbnailLoader.shared.stopPrefetching(prefetchedAssets, targetSize: gridThumbnailTargetSize())
+        prefetchedAssets = []
     }
 
     private func gridThumbnailTargetSize() -> CGSize {
@@ -738,10 +822,15 @@ struct PhotoGridView: View {
     private func rebuildTagMaps() {
         var noteMap: [String: String] = [:]
         var statusMap: [String: String] = [:]
+        var latestDate: [String: Date] = [:]
         noteMap.reserveCapacity(allTags.count)
         statusMap.reserveCapacity(allTags.count)
 
-        for tag in allTags where statusMap[tag.assetID] == nil {
+        // @Query 无排序保证；按 createdAt 取每个资产的最新标签，
+        // 与 LibraryView.calculateCounts 的判定保持一致。
+        for tag in allTags {
+            if let d = latestDate[tag.assetID], tag.createdAt <= d { continue }
+            latestDate[tag.assetID] = tag.createdAt
             noteMap[tag.assetID] = tag.note ?? ""
             statusMap[tag.assetID] = tag.status
         }
@@ -811,6 +900,24 @@ struct PhotoGridView: View {
     }
 
     func loadPhotos() {
+        // 权限被拒/受限：给出“去设置”空状态，而不是静默空列表。
+        let authStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if authStatus == .denied || authStatus == .restricted {
+            photoAccessDenied = true
+            isLoading = false
+            return
+        }
+        photoAccessDenied = false
+
+        // 首次加载完成后，pop 回来不再全库重抓（几万张时秒级）。
+        // 保留 30 秒节流的重抓，照顾外部（系统相册/iCloud）变更。
+        if hasLoadedOnce, let last = lastLoadAt,
+           Date().timeIntervalSince(last) < Self.reloadThrottleInterval {
+            // onDisappear 配对 stop 过 prefetch，回来时重新预热即可。
+            prefetchInitialThumbnails()
+            return
+        }
+
         DispatchQueue.global(qos: .userInitiated).async {
             let options = PHFetchOptions()
             options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
@@ -830,8 +937,11 @@ struct PhotoGridView: View {
                 self.allAssetsSnapshot = snapshot
                 self.assets = self.applyStatusFilter(to: snapshot, statusByAssetID: self.statusByAssetID)
                 self.isLoading = false
+                self.hasLoadedOnce = true
+                self.lastLoadAt = Date()
                 self.cachedYearsMonths = self.yearsMonthsForAssets(self.assets)
                 self.recomputeFilteredAssets()
+                self.recomputePendingDeleteCache()
                 // Pre-warm thumbnail cache for first batch of visible photos
                 self.prefetchInitialThumbnails()
             }
@@ -840,7 +950,8 @@ struct PhotoGridView: View {
 
     func deleteMarkedPhotos() {
         guard !isDeletingPhotos else { return }
-        let deleteIDs = allTags.filter { $0.status == "delete" }.map { $0.assetID }
+        // 与菜单上的 "(N)" 用同一份缓存，保证按钮数字 == 实际删除数。
+        let deleteIDs = pendingDeleteAssetsCache.map(\.localIdentifier)
         guard !deleteIDs.isEmpty else { return }
         isDeletingPhotos = true
         PhotoLibraryAuth.requestWriteAccess { granted in
@@ -969,8 +1080,13 @@ struct PhotoGridView: View {
             : "grid.ai.progress.duplicates".localized(with: start + 1, end, sorted.count)
 
         if cat == .possibleDuplicates {
-            // 增量更新 buckets -> 结果集合
-            appendDuplicateBuckets(with: batch)
+            // 增量更新 buckets -> 结果集合。bucket 计算（Calendar.dateComponents
+            // x500）放到后台，主线程先把进度浮层渲染出来。
+            let currentBuckets = aiDupBuckets
+            let updatedBuckets = await Task.detached(priority: .userInitiated) {
+                Self.mergeDuplicateBuckets(currentBuckets, adding: batch)
+            }.value
+            aiDupBuckets = updatedBuckets
             aiDuplicatesIDs = computeDuplicateIDsFromBuckets()
             aiDuplicatesOffset = end
         } else {
@@ -995,7 +1111,12 @@ struct PhotoGridView: View {
         return (Array(sortedAssets[start..<end]), start, end)
     }
 
-    private func appendDuplicateBuckets(with batch: [PHAsset]) {
+    /// Pure bucket merge so it can run off the main thread (Task.detached).
+    nonisolated private static func mergeDuplicateBuckets(
+        _ buckets: [String: [String]],
+        adding batch: [PHAsset]
+    ) -> [String: [String]] {
+        var buckets = buckets
         let calendar = Calendar.current
         for asset in batch {
             let date = asset.creationDate ?? Date.distantPast
@@ -1008,8 +1129,9 @@ struct PhotoGridView: View {
                                    comps.minute ?? 0)
             let dimKey = "\(asset.pixelWidth)x\(asset.pixelHeight)"
             let key = "\(minuteKey)|\(dimKey)"
-            aiDupBuckets[key, default: []].append(asset.localIdentifier)
+            buckets[key, default: []].append(asset.localIdentifier)
         }
+        return buckets
     }
 
     private func computeDuplicateIDsFromBuckets() -> Set<String> {
@@ -1072,21 +1194,21 @@ struct PhotoGridView: View {
             await withTaskGroup(of: String?.self) { group in
                 for asset in slice {
                     group.addTask {
-                        let isBlurry = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                        // requestImage 的回调在主线程：这里只把 UIImage 取出来，
+                        // CIEdges + CIAreaAverage + CIContext.render 留在本后台
+                        // task 里跑（CIContext 线程安全），避免扫描期间 UI 假死。
+                        let image = await withCheckedContinuation { (cont: CheckedContinuation<UIImage?, Never>) in
                             manager.requestImage(
                                 for: asset,
                                 targetSize: targetSize,
                                 contentMode: .aspectFill,
                                 options: options
                             ) { image, _ in
-                                guard let image else {
-                                    cont.resume(returning: false)
-                                    return
-                                }
-                                cont.resume(returning: isLikelyBlurry(image))
+                                cont.resume(returning: image)
                             }
                         }
-                        return isBlurry ? asset.localIdentifier : nil
+                        guard let image, isLikelyBlurry(image) else { return nil }
+                        return asset.localIdentifier
                     }
                 }
                 for await id in group {
@@ -1102,7 +1224,9 @@ struct PhotoGridView: View {
         return result
     }
 
-    private func isLikelyBlurry(_ uiImage: UIImage) -> Bool {
+    // nonisolated：在 findBlurryIDs 的后台 task 里执行（CIContext 线程安全），
+    // 不能挂在 MainActor 上，否则 Core Image 又会回到主线程。
+    nonisolated private func isLikelyBlurry(_ uiImage: UIImage) -> Bool {
         guard let cg = uiImage.cgImage else { return false }
         let ci = CIImage(cgImage: cg)
         // 更“苛刻”：提高 edge 强度 + 降低阈值，减少把清晰照片误判为模糊

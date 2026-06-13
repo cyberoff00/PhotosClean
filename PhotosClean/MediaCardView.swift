@@ -34,6 +34,7 @@ struct MediaCardView: View {
     var onEdgeSwipe: ((CGFloat) -> Void)?
 
     @State private var isVideoLoaded = false
+    @State private var isVideoReady = false
 
     private let cardWidth = UIScreen.main.bounds.width - 40
     private var cardHeight: CGFloat { (UIScreen.main.bounds.width - 40) * 4 / 3 }
@@ -55,6 +56,13 @@ struct MediaCardView: View {
                 .opacity(isHeavyPhase ? 1 : 0)
                 .allowsHitTesting(false)
 
+            // Video badge stays visible during the swipe (heavy phase) too, so a
+            // video is identifiable at a glance — its static preview is otherwise
+            // indistinguishable from a photo until the system controls load.
+            if asset.mediaType == .video {
+                videoBadgeTopLeft
+            }
+
             // 3) 控件只在非 heavy phase 显示
             if !isHeavyPhase {
                 liveBadgeBottomLeft
@@ -68,6 +76,7 @@ struct MediaCardView: View {
                 radius: isHeavyPhase ? 0 : 10, x: 0, y: 5)
         .onChange(of: asset.localIdentifier) { _, _ in
             isVideoLoaded = false
+            isVideoReady = false
         }
     }
 
@@ -133,12 +142,25 @@ struct MediaCardView: View {
     // MARK: - Video
     @ViewBuilder
     private var videoLayer: some View {
-        if let p = player {
-            StableVideoPlayerView(player: p, isMuted: isMuted)
-            .padding(12)
-        } else {
-            ZStack {
-                Color(.systemGray5)
+        ZStack {
+            if let p = player {
+                StableVideoPlayerView(player: p, isMuted: isMuted) {
+                    // First frame is decodable — uncover with a quick fade so the
+                    // poster blends into the video instead of a gray→black jump.
+                    withAnimation(.easeOut(duration: 0.2)) { isVideoReady = true }
+                }
+
+                // Hold the poster still over the freshly-mounted player until its
+                // first frame is ready; otherwise AVPlayerViewController shows a
+                // black frame for a beat — the "flash" users hit on slow loads.
+                if !isVideoReady {
+                    videoPoster
+                        .transition(.opacity)
+                }
+            } else {
+                // Loading: cover with the poster (not gray) plus a spinner /
+                // iCloud progress, so swiping in never reveals a gray block.
+                videoPoster
                 if let videoCloudProgress {
                     VStack(spacing: 10) {
                         ProgressView(value: max(0, min(videoCloudProgress, 1)))
@@ -151,13 +173,25 @@ struct MediaCardView: View {
                     ProgressView()
                 }
             }
-            .padding(12)
-            .onAppear {
-                if !isVideoLoaded {
-                    isVideoLoaded = true
-                    onLoadVideo()
-                }
+        }
+        .padding(12)
+        .onAppear {
+            if player == nil, !isVideoLoaded {
+                isVideoLoaded = true
+                onLoadVideo()
             }
+        }
+    }
+
+    @ViewBuilder
+    private var videoPoster: some View {
+        if let img = displayImage {
+            Image(uiImage: img)
+                .resizable()
+                .interpolation(.medium)
+                .aspectRatio(contentMode: .fit)
+        } else {
+            Color(.systemGray5)
         }
     }
 
@@ -194,6 +228,42 @@ struct MediaCardView: View {
             .padding(12)
             Spacer()
         }
+    }
+
+    private var videoBadgeTopLeft: some View {
+        VStack {
+            HStack {
+                HStack(spacing: 5) {
+                    Image(systemName: "video.fill")
+                        .font(.system(size: 11, weight: .bold))
+                    Text(formattedDuration(asset.duration))
+                        .font(.system(size: 12, weight: .semibold))
+                        .monospacedDigit()
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.ultraThinMaterial)
+                .environment(\.colorScheme, .dark)
+                .clipShape(Capsule())
+                Spacer()
+            }
+            Spacer()
+        }
+        .padding(12)
+        .allowsHitTesting(false)
+    }
+
+    private func formattedDuration(_ seconds: TimeInterval) -> String {
+        guard seconds.isFinite, seconds > 0 else { return "0:00" }
+        let total = Int(seconds.rounded())
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, s)
+        }
+        return String(format: "%d:%02d", m, s)
     }
 
     private var liveBadgeBottomLeft: some View {

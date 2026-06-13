@@ -36,6 +36,7 @@ final class PaywallGate: ObservableObject {
     }
 
     func reset() {
+        objectWillChange.send()
         used = 0
         storedDateString = todayString()
     }
@@ -51,8 +52,10 @@ final class PaywallGate: ObservableObject {
             return false
         }
 
-        used += 1
+        // @AppStorage in an ObservableObject doesn't publish, and the send must
+        // precede the mutation for SwiftUI to pick it up.
         objectWillChange.send()
+        used += 1
         return true
     }
 
@@ -68,14 +71,25 @@ final class PaywallGate: ObservableObject {
     private func resetIfNewDay() {
         let today = todayString()
         if storedDateString != today {
+            // Publish before mutating so views observing the gate refresh.
+            objectWillChange.send()
             used = 0
             storedDateString = today
         }
     }
 
-    private func todayString() -> String {
+    /// Fixed POSIX locale + Gregorian calendar so the stored day key is stable
+    /// regardless of the user's calendar (e.g. Buddhist) or locale settings.
+    private static let dayFormatter: DateFormatter = {
         let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.timeZone = .current
         fmt.dateFormat = "yyyy-MM-dd"
-        return fmt.string(from: Date())
+        return fmt
+    }()
+
+    private func todayString() -> String {
+        Self.dayFormatter.string(from: Date())
     }
 }

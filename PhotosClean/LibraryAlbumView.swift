@@ -26,9 +26,21 @@ struct LibraryCleanView: View {
 
     @State private var cardCache: [String: CardState] = [:]
     @State private var loadingIDs: Set<String> = []
+    /// Cards whose image request failed permanently (e.g. iCloud fetch error).
+    /// Shown as an error placeholder with tap-to-retry instead of an endless spinner.
+    @State private var failedIDs: Set<String> = []
+    /// asset.localIdentifier -> in-flight PHImageRequestID, so trimmed/offscreen
+    /// card requests can actually be cancelled (mirrors the video request logic).
+    @State private var cardRequestIDs: [String: PHImageRequestID] = [:]
+    /// Live container size from the GeometryReader. Image requests are sized to
+    /// this instead of the full UIScreen bounds, which lowers decode memory.
+    @State private var containerSize: CGSize = .zero
 
-    private let preloadForwardCount = 8
-    private let preloadBackCount = 6
+    // Each cached card is decoded near screen size (several MB a piece), so the
+    // preload/retention windows must stay tight to keep the peak footprint low.
+    private let preloadForwardCount = 3
+    private let preloadBackCount = 2
+    private let keepWindowRadius = 6
 
     @State private var tagCache: [String: PhotoTag] = [:]
 
@@ -63,6 +75,9 @@ struct LibraryCleanView: View {
     @State private var showShareOptions = false
     @State private var showPreview = false
     @State private var previewImage: UIImage?
+    /// Guards the "share original" flow: blocks duplicate taps and drives the
+    /// loading overlay while the full-size data is being fetched (maybe iCloud).
+    @State private var isSharePreparing = false
     
     @State private var isAnimatingOut = false
     private var isInteractionHeavyPhase: Bool { (dragOffset != .zero) || isAnimatingOut }
@@ -109,6 +124,10 @@ struct LibraryCleanView: View {
                         GeometryReader { geo in
                             cardStackView(containerSize: geo.size)
                                 .frame(width: geo.size.width, height: geo.size.height)
+                                .onAppear { containerSize = geo.size }
+                                .onChange(of: geo.size) { _, newSize in
+                                    containerSize = newSize
+                                }
                         }
                     }
                 }
@@ -127,6 +146,16 @@ struct LibraryCleanView: View {
             if showPreview, let preview = previewImage {
                 previewOverlay(image: preview)
             }
+
+            if isSharePreparing {
+                ZStack {
+                    Color.black.opacity(0.25).ignoresSafeArea()
+                    ProgressView("share.preparing".localized)
+                        .padding(20)
+                        .background(.regularMaterial)
+                        .cornerRadius(12)
+                }
+            }
         }
         .onAppear {
             buildTagCache()
@@ -137,6 +166,7 @@ struct LibraryCleanView: View {
         .onDisappear {
             stopAllMedia()
             cancelAllVideoRequests()
+            cancelAllCardRequests()
         }
         .onChange(of: index) { _, _ in
             stopAllMedia()
@@ -171,14 +201,21 @@ struct LibraryCleanView: View {
                         if let card = cardCache[id] {
                             mediaCardView(for: card, isInteractive: isTop, containerSize: containerSize)
                         } else {
-                            placeholderCard(containerSize: containerSize)
+                            placeholderCard(containerSize: containerSize, isFailed: failedIDs.contains(id))
                                 .onAppear { loadCardStateIfNeeded(for: asset) }
+                                .onTapGesture {
+                                    // Tap-to-retry for failed loads.
+                                    if failedIDs.contains(id) {
+                                        failedIDs.remove(id)
+                                        loadCardStateIfNeeded(for: asset)
+                                    }
+                                }
                         }
                     }
                     .offset(x: isTop ? currentCardOffset.width : 0, y: 0)
                     .opacity(shouldShow ? 1 : 0)
                     .zIndex(isTop ? 2 : (off == 1 ? 1 : 0))
-                    .allowsHitTesting(isTop && !isAnimatingOut && cardCache[id] != nil)
+                    .allowsHitTesting(isTop && !isAnimatingOut && (cardCache[id] != nil || failedIDs.contains(id)))
                     .highPriorityGesture(
                         isTop ? cardGesture() : nil,
                         including: (isTop && !isZooming) ? .all : .subviews
@@ -188,13 +225,30 @@ struct LibraryCleanView: View {
         }
     }
 
-    private func placeholderCard(containerSize: CGSize) -> some View {
+    private func placeholderCard(containerSize: CGSize, isFailed: Bool) -> some View {
         ZStack {
             Color(.secondarySystemBackground)
-            ProgressView()
+            if isFailed {
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.title2)
+                        .foregroundColor(.secondary)
+                    Text("library.card.loadFailed".localized)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                    Text("common.tapToRetry".localized)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+            } else {
+                ProgressView()
+            }
         }
         .frame(width: containerSize.width, height: containerSize.height)
         .clipped()
+        .contentShape(Rectangle())
     }
 
     // MARK: - Gesture
@@ -506,37 +560,84 @@ struct LibraryCleanView: View {
         let start = max(0, index - preloadBackCount)
         let end = min(assets.count - 1, index + preloadForwardCount)
 
-        for i in start...end {
+        // Load the current card first, then neighbors by distance, so the
+        // visible card always wins the request queue.
+        for i in (start...end).sorted(by: { abs($0 - index) < abs($1 - index) }) {
             loadCardStateIfNeeded(for: assets[i])
         }
 
         if !force {
-            let keepFrom = max(0, index - preloadBackCount - 10)
-            let keepTo = min(assets.count - 1, index + preloadForwardCount + 10)
-            let keepIDs = Set((keepFrom...keepTo).map { assets[$0].localIdentifier })
+            let keepIDs = keepWindowIDs()
             cardCache = cardCache.filter { keepIDs.contains($0.key) }
+            cancelStaleCardRequests(keeping: keepIDs)
+            // Allow failed cards outside the window to retry automatically
+            // the next time the user scrolls back to them.
+            failedIDs = failedIDs.filter { keepIDs.contains($0) }
         }
+    }
+
+    /// IDs within the retention window around the current index. Cached cards /
+    /// in-flight requests outside this window are trimmed and cancelled.
+    private func keepWindowIDs() -> Set<String> {
+        guard assets.indices.contains(index) else { return [] }
+        let keepFrom = max(0, index - keepWindowRadius)
+        let keepTo = min(assets.count - 1, index + keepWindowRadius)
+        return Set((keepFrom...keepTo).map { assets[$0].localIdentifier })
     }
 
     private func loadCardStateIfNeeded(for asset: PHAsset) {
         let id = asset.localIdentifier
         if cardCache[id] != nil { return }
         if loadingIDs.contains(id) { return }
+        if failedIDs.contains(id) { return } // waits for explicit retry / window re-entry
         loadingIDs.insert(id)
 
-        loadCardState(for: asset) { card in
+        let requestID = loadCardState(for: asset) { card, isDegraded in
             DispatchQueue.main.async {
-                self.loadingIDs.remove(id)
-                // Always update: first call inserts degraded, second call upgrades to high quality
+                // Request was cancelled or trimmed while in flight — drop the result.
+                guard self.loadingIDs.contains(id) else { return }
+
+                // A late callback must not resurrect a card that has been
+                // trimmed out of the retention window.
+                guard self.keepWindowIDs().contains(id) else {
+                    self.loadingIDs.remove(id)
+                    if let rid = self.cardRequestIDs.removeValue(forKey: id) {
+                        PHImageManager.default().cancelImageRequest(rid)
+                    }
+                    return
+                }
+
+                guard let card else {
+                    // Permanent failure: surface an error placeholder instead
+                    // of spinning forever.
+                    self.loadingIDs.remove(id)
+                    self.cardRequestIDs.removeValue(forKey: id)
+                    self.failedIDs.insert(id)
+                    return
+                }
+
+                // First call inserts degraded, second call upgrades to high quality.
                 self.cardCache[id] = card
+                if !isDegraded {
+                    self.loadingIDs.remove(id)
+                    self.cardRequestIDs.removeValue(forKey: id)
+                }
             }
+        }
+        if requestID != PHInvalidImageRequestID {
+            cardRequestIDs[id] = requestID
         }
     }
 
-    private func loadCardState(for asset: PHAsset, completion: @escaping (CardState) -> Void) {
+    private func loadCardState(
+        for asset: PHAsset,
+        completion: @escaping (_ card: CardState?, _ isDegraded: Bool) -> Void
+    ) -> PHImageRequestID {
+        // Size requests to the actual card container (when known) instead of the
+        // full screen bounds — smaller decode, lower memory peak.
         let scale = UIScreen.main.scale
-        let screen = UIScreen.main.bounds.size
-        let target = CGSize(width: screen.width * scale, height: screen.height * scale)
+        let base = (containerSize == .zero) ? UIScreen.main.bounds.size : containerSize
+        let target = CGSize(width: base.width * scale, height: base.height * scale)
 
         let opt = PHImageRequestOptions()
         opt.isNetworkAccessAllowed = true
@@ -544,16 +645,37 @@ struct LibraryCleanView: View {
         opt.resizeMode = .fast
         opt.version = .current
 
-        PHImageManager.default().requestImage(
+        return PHImageManager.default().requestImage(
             for: asset,
             targetSize: target,
             contentMode: .aspectFit,
             options: opt
         ) { img, info in
             if let cancelled = info?[PHImageCancelledKey] as? Bool, cancelled { return }
-            guard let img else { return }
-            completion(CardState(asset: asset, image: img))
+            let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            guard let img else {
+                // nil + non-degraded means the request finished without an image.
+                if !degraded { completion(nil, false) }
+                return
+            }
+            completion(CardState(asset: asset, image: img), degraded)
         }
+    }
+
+    private func cancelStaleCardRequests(keeping keepIDs: Set<String>) {
+        for (id, requestID) in Array(cardRequestIDs) where !keepIDs.contains(id) {
+            PHImageManager.default().cancelImageRequest(requestID)
+            cardRequestIDs.removeValue(forKey: id)
+            loadingIDs.remove(id)
+        }
+    }
+
+    private func cancelAllCardRequests() {
+        for requestID in cardRequestIDs.values {
+            PHImageManager.default().cancelImageRequest(requestID)
+        }
+        cardRequestIDs.removeAll()
+        loadingIDs.removeAll()
     }
 
     // MARK: - Media
@@ -595,8 +717,8 @@ struct LibraryCleanView: View {
         }
 
         let scale = UIScreen.main.scale
-        let screen = UIScreen.main.bounds.size
-        let target = CGSize(width: screen.width * scale, height: screen.height * scale)
+        let base = (containerSize == .zero) ? UIScreen.main.bounds.size : containerSize
+        let target = CGSize(width: base.width * scale, height: base.height * scale)
 
         let opt = PHLivePhotoRequestOptions()
         opt.isNetworkAccessAllowed = true
@@ -1009,19 +1131,39 @@ struct LibraryCleanView: View {
     // MARK: - Share Functions
     private func shareOriginalImage() {
         showShareOptions = false
-        guard let asset = currentAsset else { return }
+        guard !isSharePreparing, let asset = currentAsset else { return }
 
         if asset.mediaType == .video {
+            isSharePreparing = true
             let opt = PHVideoRequestOptions()
             opt.isNetworkAccessAllowed = true
             PHImageManager.default().requestAVAsset(forVideo: asset, options: opt) { av, _, _ in
-                guard let url = (av as? AVURLAsset)?.url else { return }
                 DispatchQueue.main.async {
+                    self.isSharePreparing = false
+                    guard let url = (av as? AVURLAsset)?.url else { return }
                     presentShareSheet(items: [url])
                 }
             }
-        } else if let image = currentCard?.image {
-            presentShareSheet(items: [image])
+        } else {
+            // "Share original" must export the actual full-resolution data, not the
+            // screen-sized card image that happens to be in the cache.
+            isSharePreparing = true
+            let opt = PHImageRequestOptions()
+            opt.isNetworkAccessAllowed = true
+            opt.deliveryMode = .highQualityFormat
+            opt.version = .current
+            PHImageManager.default().requestImageDataAndOrientation(for: asset, options: opt) { data, _, _, _ in
+                DispatchQueue.main.async {
+                    self.isSharePreparing = false
+                    if let data, let image = UIImage(data: data) {
+                        presentShareSheet(items: [image])
+                    } else if let fallback = self.currentCard?.image {
+                        // iCloud fetch failed — fall back to the on-screen image
+                        // rather than doing nothing.
+                        presentShareSheet(items: [fallback])
+                    }
+                }
+            }
         }
     }
 
@@ -1102,10 +1244,22 @@ struct LibraryCleanView: View {
 
     private func presentShareSheet(items: [Any]) {
         let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
-        UIApplication.shared.connectedScenes
-            .compactMap { ($0 as? UIWindowScene)?.windows.first?.rootViewController }
-            .first?
-            .present(vc, animated: true)
+        guard let root = UIApplication.shared.connectedScenes
+            .compactMap({ ($0 as? UIWindowScene)?.windows.first?.rootViewController })
+            .first else { return }
+
+        // On iPad UIActivityViewController is a popover and crashes without an
+        // anchor; center it on the presenting view.
+        if let pop = vc.popoverPresentationController {
+            pop.sourceView = root.view
+            pop.sourceRect = CGRect(
+                x: root.view.bounds.midX,
+                y: root.view.bounds.midY,
+                width: 1, height: 1
+            )
+            pop.permittedArrowDirections = []
+        }
+        root.present(vc, animated: true)
     }
 
     // MARK: - Preview

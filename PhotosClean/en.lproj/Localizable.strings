@@ -178,6 +178,20 @@
 // Restore purchase
 "sub.restore" = "Restore Purchases";
 
+// Purchase outcome alerts
+"sub.purchase.pending.title" = "Purchase Pending Approval";
+"sub.purchase.pending.message" = "Your purchase is waiting for approval (Ask to Buy). Premium will unlock automatically once it's approved.";
+"sub.purchase.failed.title" = "Purchase Failed";
+"sub.purchase.failed.message" = "The purchase could not be completed. Please try again.\n(%@)";
+
+// Restore outcome alerts
+"sub.restore.success.title" = "Purchases Restored";
+"sub.restore.success.message" = "Your Premium access has been restored.";
+"sub.restore.none.title" = "No Purchases to Restore";
+"sub.restore.none.message" = "No previous purchases were found. Please make sure you're signed in with the Apple ID you used to purchase, or contact the developer for help.";
+"sub.restore.failed.title" = "Restore Failed";
+"sub.restore.failed.message" = "Purchases could not be restored. Please check your network connection and try again.\n(%@)";
+
 // Load failed
 "sub.load.failed.title" = "Unable to load subscription plans";
 "sub.load.failed.hint" = "Please check your network connection and try again. If you're using a VPN, try disabling it — your App Store region must match your Apple ID region.";
@@ -204,8 +218,10 @@
 "filter.day" = "Day";
 "filter.week" = "Week";
 "filter.month" = "Month";
-"filter.random" = "Random date";
+"filter.random" = "Random day";
 "filter.random_date" = "Random: %@";
+"filter.pick_month" = "Pick a month";
+"loading.preparing" = "Loading photos…";
 "random.empty.title" = "This day is done";
 "random.empty.description" = "Pick another random day and keep going.";
 "random.empty.cta" = "Another batch";
@@ -213,6 +229,7 @@
 /* Common */
 "app.name" = "Tastytidy";
 "common.cancel" = "Cancel";
+"common.done" = "Done";
 "common.preview" = "Preview";
 "common.share" = "Share";
 
@@ -302,3 +319,21 @@
 "feedback.send" = "Send";
 "feedback.nomail.title" = "No mail app found";
 "feedback.nomail.message" = "Please email us at %@";
+
+/* Sharing */
+"share.preparing" = "Preparing to share…";
+"share.failed" = "Couldn't prepare the share. Please try again.";
+
+/* Undo */
+"undo.restored.other" = "Restored — this photo isn't in the current view.";
+"undo.failed.deleted" = "Can't undo — the photo was already deleted.";
+
+/* Photo access */
+"grid.photoAccess.deniedTitle" = "No Access to Photos";
+"grid.photoAccess.deniedMessage" = "Photo access is denied or restricted. Open Settings and allow full access to view and clean your photos.";
+
+/* Library */
+"library.card.loadFailed" = "Couldn't load this item";
+"common.tapToRetry" = "Tap to retry";
+"library.limited.notice" = "TastyTidy can only access the photos you've selected, so counts may be incomplete.";
+"library.limited.manage" = "Manage Selected Photos";

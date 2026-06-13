@@ -8,6 +8,7 @@
 
 import Foundation
 import SwiftUI
+import UIKit
 import Photos
 import Combine
 import WidgetKit
@@ -62,6 +63,10 @@ final class StorageStats: ObservableObject {
 
     @Published private(set) var preciseSizes: [String: Int64] = [:]
     @Published private(set) var estimatedSizes: [String: Int64] = [:]
+    /// Last time each precise entry was written / re-requested, used for LRU
+    /// trimming of the disk cache. Entries loaded from the legacy on-disk format
+    /// have no timestamp and are treated as oldest.
+    private var preciseLastTouch: [String: Date] = [:]
     private var inflightIDs: Set<String> = []
     private var lastKnownPendingBytes: Int64 = 0
     private var widgetReloadTask: Task<Void, Never>?
@@ -79,18 +84,49 @@ final class StorageStats: ObservableObject {
         return dir.appendingPathComponent("storage_stats_cache.json")
     }()
 
+    /// Token for the foreground notification observer that drives day rollover.
+    private var foregroundObserver: NSObjectProtocol?
+
     init() {
         loadCacheFromDisk()
         if let migrated = Self.legacyGoalMigration[Int64(dailyGoalRaw)] {
             dailyGoalRaw = Double(migrated)
         }
+        // Day rollover happens at explicit times (init + returning to
+        // foreground), never inside getters — getters stay pure reads.
+        checkDayRollover()
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkDayRollover()
+            }
+        }
+    }
+
+    deinit {
+        if let foregroundObserver {
+            NotificationCenter.default.removeObserver(foregroundObserver)
+        }
     }
 
     // MARK: - Daily progress
 
+    /// Pure read: if the persisted value belongs to a previous day, report 0.
+    /// The actual reset is performed by `checkDayRollover()` / `recordCleanup`.
     var dailyBytesCleaned: Int64 {
-        resetIfNewDay()
+        guard dailyBytesDate == Self.todayString() else { return 0 }
         return Int64(dailyBytesCleanedRaw)
+    }
+
+    /// Resets the daily counter when the date has rolled over and notifies the
+    /// UI. Called from init and on every return to foreground.
+    func checkDayRollover() {
+        if resetIfNewDay() {
+            objectWillChange.send()
+        }
     }
 
     var totalBytesCleaned: Int64 {
@@ -289,6 +325,12 @@ final class StorageStats: ObservableObject {
             estimatedSizes[a.localIdentifier] = estimatedSize(for: a)
         }
 
+        // Touch already-cached entries so recently used assets survive LRU trims.
+        let now = Date()
+        for a in assets where preciseSizes[a.localIdentifier] != nil {
+            preciseLastTouch[a.localIdentifier] = now
+        }
+
         let missing = assets.filter {
             preciseSizes[$0.localIdentifier] == nil &&
             !inflightIDs.contains($0.localIdentifier)
@@ -309,7 +351,11 @@ final class StorageStats: ObservableObject {
             DispatchQueue.main.async {
                 // Mutating @Published preciseSizes already emits objectWillChange,
                 // so no explicit send() is needed (it would double the re-render).
-                for (id, size) in batch { self.preciseSizes[id] = size }
+                let stamp = Date()
+                for (id, size) in batch {
+                    self.preciseSizes[id] = size
+                    self.preciseLastTouch[id] = stamp
+                }
                 missing.forEach { self.inflightIDs.remove($0.localIdentifier) }
                 // Debounced + off-main: encoding up to 5000 entries and writing
                 // atomically used to run on the main thread on every batch, which
@@ -325,6 +371,12 @@ final class StorageStats: ObservableObject {
         let resources = PHAssetResource.assetResources(for: asset)
         var total: Int64 = 0
         for r in resources {
+            // "fileSize" is a private (undocumented) KVC key. value(forKey:) on a
+            // key the class doesn't expose raises NSUnknownKeyException and would
+            // crash, so gate it behind responds(to:). If a future iOS drops the
+            // accessor we return 0 and callers fall back to the pixel estimate
+            // (precacheSizes only stores results > 0).
+            guard r.responds(to: NSSelectorFromString("fileSize")) else { continue }
             if let n = r.value(forKey: "fileSize") as? NSNumber {
                 total += n.int64Value
             }
@@ -332,12 +384,16 @@ final class StorageStats: ObservableObject {
         return total
     }
 
-    private func resetIfNewDay() {
+    /// Performs the day rollover if needed. Returns true when a reset happened.
+    /// Only called from explicit mutation points (init/foreground/recordCleanup),
+    /// never from getters.
+    @discardableResult
+    private func resetIfNewDay() -> Bool {
         let today = Self.todayString()
-        if dailyBytesDate != today {
-            dailyBytesCleanedRaw = 0
-            dailyBytesDate = today
-        }
+        guard dailyBytesDate != today else { return false }
+        dailyBytesCleanedRaw = 0
+        dailyBytesDate = today
+        return true
     }
 
     /// Static formatter — creating a `DateFormatter` per call is a known perf trap
@@ -367,10 +423,23 @@ final class StorageStats: ObservableObject {
 
     // MARK: - Disk cache
 
+    /// On-disk entry: size + last-touch timestamp (for LRU trimming).
+    /// `t` is optional so entries written by older builds (plain [String: Int64])
+    /// can be represented after migration as "no timestamp = oldest".
+    private struct PersistedSizeEntry: Codable {
+        var s: Int64
+        var t: Date?
+    }
+
     private func loadCacheFromDisk() {
-        guard let data = try? Data(contentsOf: cacheURL),
-              let decoded = try? JSONDecoder().decode([String: Int64].self, from: data) else { return }
-        preciseSizes = decoded
+        guard let data = try? Data(contentsOf: cacheURL) else { return }
+        if let decoded = try? JSONDecoder().decode([String: PersistedSizeEntry].self, from: data) {
+            preciseSizes = decoded.mapValues { $0.s }
+            preciseLastTouch = decoded.compactMapValues { $0.t }
+        } else if let legacy = try? JSONDecoder().decode([String: Int64].self, from: data) {
+            // Legacy format (pre-LRU): sizes only, treated as untouched/oldest.
+            preciseSizes = legacy
+        }
     }
 
     /// Coalesces rapid precache completions into at most one disk write per
@@ -387,15 +456,29 @@ final class StorageStats: ObservableObject {
 
     private func saveCacheToDisk() {
         // Trim mutates @Published preciseSizes, so it must stay on the main actor.
+        // LRU: keep the 5000 most recently touched entries; legacy entries with
+        // no timestamp count as oldest and get evicted first. (The previous
+        // Dictionary.prefix trim kept an arbitrary, hash-order subset.)
         if preciseSizes.count > 5000 {
-            let trimmed = Array(preciseSizes.prefix(5000))
-            preciseSizes = Dictionary(uniqueKeysWithValues: trimmed)
+            let keep = Set(
+                preciseSizes.keys
+                    .sorted { (preciseLastTouch[$0] ?? .distantPast) > (preciseLastTouch[$1] ?? .distantPast) }
+                    .prefix(5000)
+            )
+            preciseSizes = preciseSizes.filter { keep.contains($0.key) }
+            preciseLastTouch = preciseLastTouch.filter { keep.contains($0.key) }
         }
         // Snapshot, then encode + write on the background work queue.
         let snap = preciseSizes
+        let touchSnap = preciseLastTouch
         let url = cacheURL
         workQueue.async {
-            guard let data = try? JSONEncoder().encode(snap) else { return }
+            var out: [String: PersistedSizeEntry] = [:]
+            out.reserveCapacity(snap.count)
+            for (id, size) in snap {
+                out[id] = PersistedSizeEntry(s: size, t: touchSnap[id])
+            }
+            guard let data = try? JSONEncoder().encode(out) else { return }
             try? data.write(to: url, options: .atomic)
         }
     }

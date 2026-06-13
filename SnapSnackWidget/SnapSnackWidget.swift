@@ -23,14 +23,45 @@ struct Provider: TimelineProvider {
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<SimpleEntry>) -> ()) {
-        let timeline = Timeline(entries: [fetchEntry()], policy: .atEnd)
-        completion(timeline)
+        // The "pending today" count and goal progress are day-scoped, but the
+        // app-group values are only rewritten when the app runs. A single
+        // .atEnd entry therefore keeps showing yesterday's numbers across
+        // midnight. Provide an extra entry at the next midnight that resets
+        // the today-scoped fields, and refresh again right after midnight.
+        let now = Date()
+        let calendar = Calendar.current
+        let nextMidnight = calendar.startOfDay(for: calendar.date(byAdding: .day, value: 1, to: now) ?? now)
+
+        let current = fetchEntry(for: now)
+        var entries = [current]
+        if nextMidnight > now {
+            entries.append(midnightResetEntry(from: current, at: nextMidnight))
+        }
+
+        completion(Timeline(entries: entries, policy: .after(nextMidnight)))
     }
 
-    private func fetchEntry() -> SimpleEntry {
+    /// Entry shown from midnight on: a new day has no sorted/pending photos
+    /// yet, so the day-scoped fields reset. Persistent settings (goal on/off,
+    /// goal size) carry over; the remaining amount resets to the full goal.
+    private func midnightResetEntry(from entry: SimpleEntry, at date: Date) -> SimpleEntry {
+        SimpleEntry(
+            date: date,
+            count: 0,
+            goalEnabled: entry.goalEnabled,
+            goalHit: false,
+            pendingLabel: "0 MB",
+            remainingLabel: entry.goalLabel.isEmpty ? "0 MB" : entry.goalLabel,
+            goalLabel: entry.goalLabel,
+            pendingBytes: 0,
+            goalBytes: entry.goalBytes
+        )
+    }
+
+    private func fetchEntry(for date: Date = Date()) -> SimpleEntry {
         let d = UserDefaults(suiteName: appGroupID)
         return SimpleEntry(
-            date: Date(),
+            date: date,
             count: d?.integer(forKey: "finalDisplayCount") ?? 0,
             goalEnabled: d?.bool(forKey: "goal_enabled") ?? false,
             goalHit: d?.bool(forKey: "goal_hit") ?? false,

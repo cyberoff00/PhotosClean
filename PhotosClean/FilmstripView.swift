@@ -87,6 +87,11 @@ private struct FilmstripThumb: View {
 
     @State private var image: UIImage?
     @State private var requestID: PHImageRequestID = PHInvalidImageRequestID
+    /// The asset id the latest request was issued for. Captured-struct `self`
+    /// inside the callback is a snapshot, so comparing `asset.localIdentifier`
+    /// against itself was always true; @State reads through to the live value
+    /// and actually rejects out-of-order callbacks after the view is recycled.
+    @State private var inFlightAssetID: String = ""
 
     var body: some View {
         ZStack {
@@ -108,25 +113,35 @@ private struct FilmstripThumb: View {
         .frame(width: side, height: side)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .onAppear { request() }
-        .onChange(of: asset.localIdentifier) { _, _ in request() }
+        .onChange(of: asset.localIdentifier) { _, _ in
+            // View was recycled for a different asset: drop the stale image
+            // immediately so the old photo doesn't flash on the new slot.
+            image = nil
+            request()
+        }
         .onDisappear { PHAssetThumbnailLoader.shared.cancel(requestID) }
     }
 
     private func request() {
+        // Cancel whatever was in flight for the previous asset.
         PHAssetThumbnailLoader.shared.cancel(requestID)
         requestID = PHInvalidImageRequestID
+
+        let expectedID = asset.localIdentifier
+        inFlightAssetID = expectedID
 
         let scale = UIScreen.main.scale
         let target = CGSize(width: side * scale * 1.2, height: side * scale * 1.2)
 
-        if let cached = PHAssetThumbnailLoader.shared.cachedImage(for: asset.localIdentifier, targetSize: target) {
+        if let cached = PHAssetThumbnailLoader.shared.cachedImage(for: expectedID, targetSize: target) {
             image = cached
             return
         }
 
         requestID = PHAssetThumbnailLoader.shared.requestThumbnail(asset: asset, targetSize: target) { img, _ in
-            guard asset.localIdentifier == self.asset.localIdentifier else { return }
-            self.image = img
+            // Compare against the live @State token, not the captured struct.
+            guard self.inFlightAssetID == expectedID else { return }
+            if let img { self.image = img }
         }
     }
 }

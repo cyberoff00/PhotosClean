@@ -1,6 +1,8 @@
 import SwiftUI
 import SwiftData
 import Photos
+import PhotosUI
+import UIKit
 
 struct LibraryView: View {
     @EnvironmentObject var storeManager: StoreManager
@@ -11,6 +13,9 @@ struct LibraryView: View {
     /// Guards against a slower earlier count finishing after a newer one and
     /// overwriting it with stale numbers on rapid tab switches.
     @State private var countsToken = 0
+    /// True when Photos access is `.limited` — counts only cover the selection,
+    /// so surface a hint plus a "manage selection" entry point.
+    @State private var isLimitedAccess = false
 
     @AppStorage("hint_library_category_dismissed") private var categoryHintDismissed = false
     @AppStorage("hint_library_todelete_dismissed") private var toDeleteHintDismissed = false
@@ -28,6 +33,26 @@ struct LibraryView: View {
     var body: some View {
         NavigationStack {
             List {
+                if isLimitedAccess {
+                    Section {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label {
+                                Text("library.limited.notice".localized)
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle")
+                                    .foregroundColor(.orange)
+                            }
+                            Button("library.limited.manage".localized) {
+                                presentLimitedLibraryPicker()
+                            }
+                            .font(.footnote.weight(.semibold))
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+
                 NavigationLink(
                     destination: PhotoGridView(
                         title: "library.title".localized,
@@ -164,7 +189,17 @@ struct LibraryView: View {
                     .accessibilityLabel("settings.title".localized)
                 }
             }
-            .onAppear(perform: calculateCounts)
+            .onAppear {
+                refreshAuthorizationState()
+                calculateCounts()
+            }
+            // PhotoLibraryObserver (PhotosCleanApp) already debounces
+            // photoLibraryDidChange into this app-wide notification — reuse it so
+            // counts stay fresh after deletes / iCloud sync / limited-selection edits.
+            .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ReloadPhotos"))) { _ in
+                refreshAuthorizationState()
+                calculateCounts()
+            }
 
             // ✅ 放在 TabBar 上方：透明、不带背景、不像 tab 的一部分
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -208,6 +243,17 @@ struct LibraryView: View {
         .background(Color.clear)
     }
 
+    private func refreshAuthorizationState() {
+        isLimitedAccess = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited
+    }
+
+    private func presentLimitedLibraryPicker() {
+        guard let root = UIApplication.shared.connectedScenes
+            .compactMap({ ($0 as? UIWindowScene)?.windows.first?.rootViewController })
+            .first else { return }
+        PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: root)
+    }
+
     func calculateCounts() {
         countsToken += 1
         let token = countsToken
@@ -227,7 +273,9 @@ struct LibraryView: View {
         // switching to this tab. Run it off the main thread and count in a single
         // pass (no intermediate ID array), then publish back on the main thread.
         DispatchQueue.global(qos: .userInitiated).async {
-            let fetched = PHAsset.fetchAssets(with: .image, options: nil)
+            // 不限定媒体类型：PhotoGridView 抓的是全部资产（含视频），
+            // 这里必须一致，否则行计数和网格内"全部删除 (N)"对不上。
+            let fetched = PHAsset.fetchAssets(with: PHFetchOptions())
             var all = 0, keep = 0, maybe = 0, delete = 0, pending = 0
             fetched.enumerateObjects { asset, _, _ in
                 all += 1
@@ -277,10 +325,6 @@ struct FolderRow: View {
 
             Text("\(count)")
                 .foregroundColor(.secondary)
-
-            Image(systemName: "chevron.right")
-                .font(.caption)
-                .foregroundColor(.gray)
         }
         .contentShape(Rectangle())
     }

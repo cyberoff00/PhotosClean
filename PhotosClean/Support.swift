@@ -9,24 +9,62 @@ import Photos
 import AVKit
 import UIKit
 import PhotosUI
+/// PHLivePhotoView that only begins playback once it has a non-zero layout.
+/// `startPlayback(with:)` captures the view geometry at the moment it's called,
+/// so starting it while SwiftUI hasn't laid the view out yet (bounds == .zero)
+/// makes iOS render the Live Photo shrunk into a small centered patch. Tapping a
+/// freshly-loaded Live Photo auto-plays in the same state update that mounts this
+/// view, which is exactly when bounds are still zero — hence the intermittent
+/// "plays tiny in the middle" bug. Deferring the start to `layoutSubviews` (when
+/// bounds are valid) fixes it regardless of caller timing.
+final class PlaybackLivePhotoView: PHLivePhotoView {
+    var wantsPlayback = false { didSet { syncPlayback() } }
+    private var startedPlayback = false
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        syncPlayback()
+    }
+
+    /// Call after assigning a new `livePhoto` so playback can (re)start cleanly.
+    func livePhotoDidChange() {
+        if startedPlayback {
+            stopPlayback()
+            startedPlayback = false
+        }
+        syncPlayback()
+    }
+
+    private func syncPlayback() {
+        if wantsPlayback {
+            guard bounds.width > 1, bounds.height > 1 else { return }
+            if !startedPlayback {
+                startedPlayback = true
+                startPlayback(with: .full)
+            }
+        } else if startedPlayback {
+            startedPlayback = false
+            stopPlayback()
+        }
+    }
+}
+
 struct LivePhotoView: UIViewRepresentable {
     let livePhoto: PHLivePhoto
     @Binding var isPlaying: Bool
-    
-    func makeUIView(context: Context) -> PHLivePhotoView {
-        let view = PHLivePhotoView()
+
+    func makeUIView(context: Context) -> PlaybackLivePhotoView {
+        let view = PlaybackLivePhotoView()
         view.contentMode = .scaleAspectFit
         return view
     }
-    
-    func updateUIView(_ uiView: PHLivePhotoView, context: Context) {
-        uiView.livePhoto = livePhoto
-        
-        if isPlaying {
-            uiView.startPlayback(with: .full)
-        } else {
-            uiView.stopPlayback()
+
+    func updateUIView(_ uiView: PlaybackLivePhotoView, context: Context) {
+        if uiView.livePhoto !== livePhoto {
+            uiView.livePhoto = livePhoto
+            uiView.livePhotoDidChange()
         }
+        uiView.wantsPlayback = isPlaying
     }
 }
 struct ControlButton: View {
@@ -201,6 +239,11 @@ enum L10n {
 struct StableVideoPlayerView: UIViewControllerRepresentable {
     let player: AVPlayer
     var isMuted: Bool
+    /// Fired when the current item reaches `.readyToPlay` (a frame is decodable),
+    /// so the caller can drop the poster cover instead of flashing a black frame.
+    var onReadyForDisplay: (() -> Void)? = nil
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
@@ -214,14 +257,51 @@ struct StableVideoPlayerView: UIViewControllerRepresentable {
         controller.updatesNowPlayingInfoCenter = false
         controller.view.backgroundColor = .clear
         player.isMuted = isMuted
+        context.coordinator.onReady = onReadyForDisplay
+        context.coordinator.observe(player: player)
         return controller
     }
 
     func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
+        context.coordinator.onReady = onReadyForDisplay
         if uiViewController.player !== player {
             uiViewController.player = player
+            context.coordinator.observe(player: player)
         }
         uiViewController.player?.isMuted = isMuted
+    }
+
+    final class Coordinator {
+        var onReady: (() -> Void)?
+        private var currentItemObs: NSKeyValueObservation?
+        private var statusObs: NSKeyValueObservation?
+
+        func observe(player: AVPlayer) {
+            currentItemObs = player.observe(\.currentItem, options: [.initial, .new]) { [weak self] p, _ in
+                self?.attach(to: p.currentItem)
+            }
+        }
+
+        private func attach(to item: AVPlayerItem?) {
+            statusObs?.invalidate()
+            statusObs = nil
+            guard let item else { return }
+            if item.status == .readyToPlay {
+                notifyReady()
+                return
+            }
+            statusObs = item.observe(\.status, options: [.new]) { [weak self] it, _ in
+                if it.status == .readyToPlay { self?.notifyReady() }
+            }
+        }
+
+        private func notifyReady() {
+            if Thread.isMainThread {
+                onReady?()
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.onReady?() }
+            }
+        }
     }
 }
 
