@@ -130,18 +130,6 @@ struct SubscriptionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Close
-            HStack {
-                Button(action: { dismiss() }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title2)
-                        .foregroundColor(.gray.opacity(0.5))
-                }
-                Spacer()
-            }
-            .padding(30)
-            .padding(.bottom, 10)
-
             if storeManager.hasLifetime {
                 lifetimeOwnerContent
             } else if storeManager.hasActiveSubscription {
@@ -149,6 +137,20 @@ struct SubscriptionView: View {
             } else {
                 unsubscribedContent
             }
+        }
+        // Close button pinned to the sheet's top-trailing *safe-area* corner via
+        // overlay, so it can't be clipped by the sheet's top edge the way a flow-
+        // laid row could. Two-tone palette so it reads as a real close button.
+        .overlay(alignment: .topTrailing) {
+            Button(action: { dismiss() }) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title2)
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(Color(.systemGray2), Color(.systemGray5))
+            }
+            .padding(.top, 16)
+            .padding(.trailing, 16)
+            .accessibilityLabel(Text("common.close"))
         }
         .onAppear {
             guard !hasInitialized else { return }

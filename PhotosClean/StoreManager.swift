@@ -115,7 +115,8 @@ final class StoreManager: ObservableObject {
             if let self {
                 async let offerings: Void = self.loadOfferings()
                 async let info: Void = self.refreshCustomerInfo()
-                _ = await (offerings, info)
+                async let migration: Void = self.syncReceiptForMigrationIfNeeded()
+                _ = await (offerings, info, migration)
             }
             for await info in Purchases.shared.customerInfoStream {
                 guard !Task.isCancelled, let self else { return }
@@ -194,6 +195,32 @@ final class StoreManager: ObservableObject {
     }
 
     // MARK: - Entitlements
+
+    /// Key marking that the one-time post-migration receipt sync has succeeded.
+    /// Bumped to `.v1` so it runs exactly once per install after the move from
+    /// raw StoreKit to RevenueCat.
+    private static let migrationSyncKey = "rc.migrationReceiptSynced.v1"
+
+    /// Migrating from raw StoreKit to RevenueCat: `customerInfo()` only *reads*
+    /// the backend subscriber and never uploads the device's StoreKit receipt,
+    /// so a pre-migration subscriber shows up as non-premium until they manually
+    /// tap "Restore Purchases". `syncPurchases()` posts the local receipt, which
+    /// lets RevenueCat detect the existing subscription and grant the entitlement
+    /// silently. Run it once on first launch after the update (gated so we don't
+    /// hit it on every launch — RevenueCat advises against that). On failure we
+    /// leave the flag unset so it retries next launch.
+    private func syncReceiptForMigrationIfNeeded() async {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.migrationSyncKey) else { return }
+        do {
+            let info = try await Purchases.shared.syncPurchases()
+            customerInfo = info
+            recomputeStatus()
+            defaults.set(true, forKey: Self.migrationSyncKey)
+        } catch {
+            print("Migration syncPurchases failed (will retry next launch): \(error)")
+        }
+    }
 
     /// Pulls the latest entitlement snapshot from RevenueCat (cached + fast).
     func refreshCustomerInfo() async {

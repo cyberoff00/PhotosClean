@@ -279,7 +279,6 @@
 "quota.indie" = "Built by a solo developer.\nYour support means the world.";
 
 "quota.cta" = "Learn about Premium";
-"quota.reset.hint" = "Free quota resets tomorrow";
 
 /* Cleanup goal & celebration */
 "settings.cleanup.section" = "Cleanup Goal";
@@ -289,6 +288,7 @@
 "settings.cleanup.total" = "All-time freed";
 "settings.cleanup.total.explain" = "iOS keeps deleted photos in Recently Deleted for 30 days. To actually reclaim storage, open the Photos app and empty the Recently Deleted album.";
 "common.ok" = "OK";
+"common.close" = "Close";
 
 "goal.title" = "Daily goal hit!";
 "goal.subtitle" = "You've marked %@ to clean today.";

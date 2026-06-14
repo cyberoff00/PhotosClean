@@ -365,9 +365,14 @@ struct ContentView: View {
                             .padding(20)
                     }
 
-                    if shouldShowRandomContinueState {
-                        randomContinueEmptyState
-                    }
+                    // Opacity-gated (not a structural `if`) and animation-disabled
+                    // so it hard-cuts in instead of being captured by the swipe-out
+                    // animation transaction — that capture is what made the page
+                    // occasionally flash when a batch was swiped to the end.
+                    randomContinueEmptyState
+                        .opacity(shouldShowRandomContinueState ? 1 : 0)
+                        .allowsHitTesting(shouldShowRandomContinueState)
+                        .animation(.none, value: shouldShowRandomContinueState)
 
                     // Inline quota upgrade card (hard wall for free users)
                     if quotaExhaustedForFreeUser && !shouldShowStageEmptyState {
@@ -1387,6 +1392,20 @@ struct ContentView: View {
             let todayStart = calendar.startOfDay(for: Date())
             let hasMultipleDays = calendar.startOfDay(for: bounds.oldest) != calendar.startOfDay(for: bounds.newest)
 
+            // Day bucketing via integer keys instead of Calendar.startOfDay per
+            // asset. startOfDay is an ICU/Calendar call (~microseconds each); on a
+            // 50k+ library, calling it once per asset adds up to multiple seconds
+            // of cold-start "Loading…". Bucketing on (creationDate + tzOffset) /
+            // 86400 — a plain integer day index — is hundreds of times faster. The
+            // ±1h DST skew near midnight is irrelevant for "pick a random day". We
+            // keep one real creationDate per bucket so the *picked* day still gets
+            // an exact startOfDay (and thus a correct day interval) below.
+            let tzOffset = TimeInterval(TimeZone.current.secondsFromGMT(for: Date()))
+            func dayKey(_ date: Date) -> Int {
+                Int((date.timeIntervalSince1970 + tzOffset) / 86400)
+            }
+            let todayKey = dayKey(todayStart)
+
             let allOpt = PHFetchOptions()
             allOpt.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
             let all = PHAsset.fetchAssets(with: allOpt)
@@ -1396,25 +1415,31 @@ struct ContentView: View {
                 return
             }
 
-            var anyDays: Set<Date> = []
-            var pendingDays: Set<Date> = []
+            var anyDays: Set<Int> = []
+            var pendingDays: Set<Int> = []
+            var representativeDate: [Int: Date] = [:]
 
             all.enumerateObjects { asset, _, _ in
                 guard let d = asset.creationDate else { return }
-                let candidateDay = calendar.startOfDay(for: d)
-                if hasMultipleDays && candidateDay == todayStart { return }
+                let key = dayKey(d)
+                if hasMultipleDays && key == todayKey { return }
 
-                anyDays.insert(candidateDay)
+                anyDays.insert(key)
+                if representativeDate[key] == nil { representativeDate[key] = d }
 
                 let id = asset.localIdentifier
                 if sessionProcessedIDs.contains(id) { return }
                 if nonPendingIDs.contains(id) { return }
-                pendingDays.insert(candidateDay)
+                pendingDays.insert(key)
             }
 
-            let picked = (pendingDays.isEmpty ? nil : Array(pendingDays).randomElement())
-                ?? (anyDays.isEmpty ? nil : Array(anyDays).randomElement())
-            let finalDay = picked ?? calendar.startOfDay(for: bounds.newest)
+            let pickedKey = pendingDays.randomElement() ?? anyDays.randomElement()
+            let finalDay: Date
+            if let pickedKey, let rep = representativeDate[pickedKey] {
+                finalDay = calendar.startOfDay(for: rep)
+            } else {
+                finalDay = calendar.startOfDay(for: bounds.newest)
+            }
 
             DispatchQueue.main.async {
                 completion(finalDay)
@@ -2817,10 +2842,6 @@ struct ContentView: View {
                     .background(Color.orange)
                     .clipShape(Capsule())
             }
-
-            Text("quota.reset.hint")
-                .font(.caption2)
-                .foregroundColor(.secondary.opacity(0.7))
 
             Spacer()
         }

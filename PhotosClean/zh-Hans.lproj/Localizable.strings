@@ -246,10 +246,9 @@
 /* Daily Quota Upgrade Card */
 "quota.title" = "今日免费额度已用完";
 "quota.subtitle" = "每天可以免费整理 36 张照片\n升级后不再有数量限制";
-"quota.indie" = "一个人开发的小工具\n你的支持是最大的动力 ☺️";
+"quota.indie" = "一款独立开发的产品，希望带来最纯粹的产品体验\n你的支持是最大的动力";
 
-"quota.cta" = "了解 Premium";
-"quota.reset.hint" = "明天将重置免费额度";
+"quota.cta" = "了解会员";
 
 /* 清理目标与庆祝卡 */
 "settings.cleanup.section" = "清理目标";
@@ -259,6 +258,7 @@
 "settings.cleanup.total" = "累计已清理";
 "settings.cleanup.total.explain" = "iOS 会把删除的照片保留在「最近删除」相册 30 天。要真正释放存储空间，请打开系统相册，进入「最近删除」并清空。";
 "common.ok" = "好";
+"common.close" = "关闭";
 
 "goal.title" = "今日目标达成！";
 "goal.subtitle" = "今天已标记 %@ 待清理";
