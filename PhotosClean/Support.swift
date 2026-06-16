@@ -135,8 +135,11 @@ struct ZoomableImageView: UIViewRepresentable {
         // Keep coordinator in sync with latest closures and bindings
         context.coordinator.parent = self
 
-        // 更新图片
-        context.coordinator.imageView?.image = image
+        // 更新图片：只在真正变化时赋值。updateUIView 在每次 SwiftUI 刷新都会跑
+        // （拖动时 ~60Hz），无条件重设 UIImageView.image 会反复触发主线程解码/布局。
+        if context.coordinator.imageView?.image !== image {
+            context.coordinator.imageView?.image = image
+        }
         
         // 外部触发 reset
         if context.coordinator.lastResetToken != resetToken {
@@ -361,6 +364,13 @@ enum PhotoLibraryAuth {
 ///
 /// runWhenReady waits out both: it fires only once the app is active AND nothing
 /// is mid-transition. Must be called on the main thread.
+/// Diagnostic logging for the "一键清理卡死" investigation. Filter the Xcode /
+/// Console.app log by `🧹CLEAN` to follow exactly where a tap stalls. Remove once
+/// the iPad hang is understood.
+func cleanLog(_ msg: String) {
+    NSLog("🧹CLEAN %@ | thread=%@", msg, Thread.isMainThread ? "main" : "bg")
+}
+
 enum ForegroundGate {
     /// Key window of the foreground-active scene.
     private static var keyWindow: UIWindow? {
@@ -368,6 +378,22 @@ enum ForegroundGate {
             .compactMap { $0 as? UIWindowScene }
             .first { $0.activationState == .foregroundActive }?
             .windows.first { $0.isKeyWindow }
+    }
+
+    /// Human-readable snapshot of the presentation chain for diagnostics.
+    static var presentationDescription: String {
+        guard var vc = keyWindow?.rootViewController else { return "no keyWindow/rootVC" }
+        var chain: [String] = []
+        var guardCount = 0
+        while true {
+            guardCount += 1
+            if guardCount > 50 { chain.append("…(cycle?)"); break }
+            let flags = "\(vc.isBeingPresented ? "P" : "")\(vc.isBeingDismissed ? "D" : "")"
+            chain.append("\(type(of: vc))[\(flags)]")
+            guard let next = vc.presentedViewController else { break }
+            vc = next
+        }
+        return chain.joined(separator: " > ")
     }
 
     /// True while any controller in the presentation chain is being presented or
@@ -381,16 +407,41 @@ enum ForegroundGate {
         }
     }
 
+    /// Whether a foreground-active scene exists to present on.
+    ///
+    /// We deliberately do NOT use `UIApplication.shared.applicationState` here:
+    /// since the multi-scene era it is unreliable, and on iOS 26 it frequently
+    /// stays `.inactive` while the app is plainly in the foreground (e.g. the
+    /// beat right after a permission/system dialog dismisses). That made
+    /// `runWhenReady` time out and then wait forever on a `didBecomeActive`
+    /// notification that never arrives — so the system delete confirmation never
+    /// fired and the cleanup button stayed disabled forever. The scene's own
+    /// `activationState` is the source of truth.
+    private static var isForegroundActive: Bool {
+        UIApplication.shared.connectedScenes.contains {
+            ($0 as? UIWindowScene)?.activationState == .foregroundActive
+        }
+    }
+
     /// Runs `block` once the app is foreground-active and no presentation
     /// transition is in flight, retrying frame by frame until ready (capped at
     /// ~3s). If it never settles in time, falls back to firing on the next
     /// activation so the work is deferred rather than dropped.
     static func runWhenReady(_ block: @escaping () -> Void, remainingFrames: Int = 180) {
-        if UIApplication.shared.applicationState == .active && !isPresentationSettling {
+        let active = isForegroundActive
+        let settling = isPresentationSettling
+        // Log only at entry and on state changes to avoid 180 lines of spam: log
+        // the first frame, then every 30 frames while still waiting.
+        if remainingFrames == 180 || remainingFrames % 30 == 0 {
+            cleanLog("runWhenReady frame=\(remainingFrames) active=\(active) settling=\(settling) chain=[\(presentationDescription)]")
+        }
+        if active && !settling {
+            cleanLog("runWhenReady → FIRING block (frame=\(remainingFrames))")
             block()
             return
         }
         guard remainingFrames > 0 else {
+            cleanLog("runWhenReady → TIMED OUT after 3s, falling back to runWhenActive (active=\(active))")
             runWhenActive(block)
             return
         }
@@ -402,10 +453,12 @@ enum ForegroundGate {
     /// Runs `block` immediately if foreground-active, otherwise exactly once the
     /// next time the app becomes active.
     static func runWhenActive(_ block: @escaping () -> Void) {
-        if UIApplication.shared.applicationState == .active {
+        if isForegroundActive {
+            cleanLog("runWhenActive → firing immediately (active)")
             block()
             return
         }
+        cleanLog("runWhenActive → NOT active, waiting for didBecomeActive notification (may never arrive)")
         var token: NSObjectProtocol?
         token = NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
@@ -416,4 +469,101 @@ enum ForegroundGate {
             block()
         }
     }
+}
+
+// MARK: - Adaptive layout (iPhone / iPad)
+//
+// The app was originally laid out against `UIScreen.main.bounds.width`, which on
+// iPad (and in Split View) produces giant cards and over-stretched grids. These
+// helpers cap content to a phone-like column on wide screens and pick a sensible
+// grid column count, while leaving iPhone behaviour byte-for-byte identical.
+enum Layout {
+    static var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+
+    /// Width of the app's current window. Respects iPad Split View / Slide Over
+    /// (where the window is narrower than the screen) and falls back to the
+    /// screen bounds before a window exists.
+    static var windowWidth: CGFloat {
+        let scenes = UIApplication.shared.connectedScenes
+        let scene = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene
+            ?? scenes.compactMap { $0 as? UIWindowScene }.first
+        let width = scene?.windows.first(where: { $0.isKeyWindow })?.bounds.width
+            ?? scene?.windows.first?.bounds.width
+        return width ?? UIScreen.main.bounds.width
+    }
+
+    /// Current window height, mirroring `windowWidth` (respects Split View etc.).
+    static var windowHeight: CGFloat {
+        let scenes = UIApplication.shared.connectedScenes
+        let scene = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene
+            ?? scenes.compactMap { $0 as? UIWindowScene }.first
+        let height = scene?.windows.first(where: { $0.isKeyWindow })?.bounds.height
+            ?? scene?.windows.first?.bounds.height
+        return height ?? UIScreen.main.bounds.height
+    }
+
+    /// Short phones (iPhone SE / mini, < 700pt tall) where the fixed Today stage
+    /// would otherwise collide with the tab bar. iPad is never "compact" here.
+    static var isCompactHeight: Bool { !isPad && windowHeight < 700 }
+
+    /// Largest width a single swipe card may occupy. On iPad this keeps cards a
+    /// comfortable, centered column instead of stretching across the screen.
+    static let maxCardWidth: CGFloat = 460
+
+    /// Card width for a given per-side horizontal inset, capped on wide screens.
+    /// On iPhone `windowWidth - inset` is always below the cap, so the result is
+    /// unchanged from the old `UIScreen.main.bounds.width - inset`.
+    ///
+    /// On short phones the 4:3 card is *also* capped by available height so the
+    /// card + header + bottom controls never overflow into the tab bar. The cap
+    /// only bites when `isCompactHeight`, so normal/large phones and iPad keep
+    /// their existing width-driven sizing.
+    static func cardWidth(inset: CGFloat) -> CGFloat {
+        let byWidth = min(windowWidth - inset, maxCardWidth)
+        guard isCompactHeight else { return byWidth }
+        // Reserve room for the header, filmstrip and tab bar: a 4:3 card may use
+        // at most ~56% of the screen height on these devices. (The Today view
+        // reclaims space by dropping its swipe buttons and moving the storage
+        // badge onto the card, so the card can be this large.)
+        let byHeight = (windowHeight * 0.56) * 3 / 4
+        return min(byWidth, byHeight)
+    }
+
+    /// Grid columns: fixed 3 on iPhone (unchanged), adaptive on iPad.
+    static var gridColumnCount: Int {
+        guard isPad else { return 3 }
+        let target: CGFloat = 150
+        return max(4, Int((windowWidth / target).rounded(.down)))
+    }
+
+    static func gridColumns(spacing: CGFloat = 2) -> [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: spacing), count: gridColumnCount)
+    }
+
+    /// Pixel-rounded square side + matching `.fixed` columns for a known
+    /// container width. Prefer this over `gridColumns` for photo grids:
+    /// `.flexible()` columns + `.aspectRatio` produced subtly non-square cells
+    /// on small phones and iPad, whereas a fixed side + explicit square frame
+    /// is regular on every device. `width` should be the real container width
+    /// (from a GeometryReader), and the grid should keep `.padding(.horizontal,
+    /// spacing)` and center itself with `.frame(maxWidth: .infinity)`.
+    static func gridMetrics(forWidth width: CGFloat, spacing: CGFloat = 2) -> (columns: [GridItem], side: CGFloat) {
+        let count = gridColumnCount
+        let usable = width - spacing * 2 - spacing * CGFloat(count - 1)
+        let side = max((usable / CGFloat(count)).rounded(.down), 1)
+        let cols = Array(repeating: GridItem(.fixed(side), spacing: spacing), count: count)
+        return (cols, side)
+    }
+
+    /// Pixel-agnostic side length of one grid cell, matching `gridColumnCount`.
+    static func gridCellSide(spacing: CGFloat = 2) -> CGFloat {
+        let count = gridColumnCount
+        let totalSpacing = spacing * CGFloat(count + 1)
+        return ((windowWidth - totalSpacing) / CGFloat(count)).rounded(.up)
+    }
+
+    /// Distance a committed card flies off-screen. Scales with window width so
+    /// the card fully clears wide iPad screens; never below the old constants.
+    static var swipeOutDistanceX: CGFloat { max(windowWidth * 1.3, 900) }
+    static var swipeOutDistanceY: CGFloat { max(windowWidth * 1.6, 1100) }
 }

@@ -31,6 +31,9 @@ struct RetroCleanView: View {
     @State private var sourceRevision: Int = 0
     @State private var cardImageRequestIDs: [String: PHImageRequestID] = [:]
     @State private var tagCache: [String: PhotoTag] = [:]
+    // Detached, un-persisted tag edits made during this swipe session. See
+    // upsertTag / commitPendingTags for why writes are batched off the swipe path.
+    @State private var pendingTags: [String: PhotoTag] = [:]
     @State private var assetOrderByID: [String: Int] = [:]
     // Throttled SwiftData save: coalesce per-swipe writes into one save (~0.6s
     // after the last change), with a forced flush on disappear/background.
@@ -79,8 +82,15 @@ struct RetroCleanView: View {
     @State private var zoomResetToken = UUID()
     private var isZooming: Bool { imageScale > 1.01 }
 
-    private let cardWidth = UIScreen.main.bounds.width - 40
-    private var cardHeight: CGFloat { (UIScreen.main.bounds.width - 40) * 4 / 3 }
+    // Network preference for speculative iCloud prefetch (mirrors ContentView).
+    @AppStorage("prewarm_use_cellular") private var prewarmUseCellular: Bool = true
+    private var prefetchAllowedNow: Bool {
+        guard NetworkMonitor.shared.isConnected else { return false }
+        return prewarmUseCellular || NetworkMonitor.shared.isUnmetered
+    }
+
+    private var cardWidth: CGFloat { Layout.cardWidth(inset: 40) }
+    private var cardHeight: CGFloat { Layout.cardWidth(inset: 40) * 4 / 3 }
     init(assets: [PHAsset], initialIndex: Int) {
         self.assets = assets
         let safeInitialID: String
@@ -110,8 +120,8 @@ struct RetroCleanView: View {
     // MARK: - Swipe config
     private var swipeThresholdX: CGFloat { 120 }
     private var swipeThresholdY: CGFloat { 120 }
-    private var outDistanceX: CGFloat { 900 }
-    private var outDistanceY: CGFloat { 1100 }
+    private var outDistanceX: CGFloat { Layout.swipeOutDistanceX }
+    private var outDistanceY: CGFloat { Layout.swipeOutDistanceY }
 
     private var currentCardOffset: CGSize {
         CGSize(
@@ -172,7 +182,7 @@ struct RetroCleanView: View {
     private let bottomButtonsLiftFromTab: CGFloat = 52
 
     private var cardStageHeight: CGFloat {
-        let cardW = UIScreen.main.bounds.width - cardHorizontalInset
+        let cardW = Layout.cardWidth(inset: cardHorizontalInset)
         let cardH = cardW * 4 / 3
         // cardStackView uses .padding(20)
         return cardH + 40
@@ -234,11 +244,19 @@ struct RetroCleanView: View {
                 .frame(height: cardStageHeight)
             }
 
+            // Short phones (iPhone SE / mini): drop the swipe circles so the card
+            // can be larger; swipes and the on-card edge buttons still cover
+            // delete / keep / maybe. Taller phones & iPad keep the buttons.
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                bottomButtons
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 8)
-                    .padding(.bottom, bottomButtonsLiftFromTab)
+                if !Layout.isCompactHeight {
+                    bottomButtons
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 8)
+                        .padding(.bottom, bottomButtonsLiftFromTab)
+                        .opacity(activeCard != nil ? 1 : 0)
+                        .allowsHitTesting(activeCard != nil)
+                        .animation(.none, value: activeCard != nil)
+                }
             }
 
             if showNoteEditor {
@@ -259,10 +277,13 @@ struct RetroCleanView: View {
         // Retro is pushed from a NavigationStack (Library). Hide the default navigation bar
         // so its extra top inset doesn't push the whole page down compared to ContentView.
         .toolbar(.hidden, for: .navigationBar)
+        .trackFrameHitches("retro")
         .onAppear {
-            rebuildTagCache()
-            refreshFilmstripSnapshot()
-            bootstrapBuffer(force: true)
+            cleanLog("[Retro] onAppear START assets=\(assets.count) currentID=\(currentAssetID)")
+            measureMain("retro.onAppear.rebuildTagCache") { rebuildTagCache() }
+            measureMain("retro.onAppear.refreshFilmstrip") { refreshFilmstripSnapshot() }
+            measureMain("retro.onAppear.bootstrapBuffer") { bootstrapBuffer(force: true) }
+            cleanLog("[Retro] onAppear DONE")
         }
         .onDisappear {
             stopAllMedia()
@@ -279,10 +300,12 @@ struct RetroCleanView: View {
             flushPendingTagSave()
         }
         .onChange(of: activeCard?.asset.localIdentifier) { _, _ in
-            stopAllMedia()
-            resetImageZoom()
-            syncNoteForCurrent()
-            prepareMediaForCurrent()
+            measureMain("retro.activeCardChange") {
+                stopAllMedia()
+                resetImageZoom()
+                syncNoteForCurrent()
+                prepareMediaForCurrent()
+            }
         }
         .onChange(of: currentAssetID) { _, _ in
             refreshFilmstripSnapshot()
@@ -934,7 +957,22 @@ struct RetroCleanView: View {
                 }
                 return
             }
-            completion(CardState(asset: asset, image: img), isDegraded)
+            if isDegraded {
+                // Low-res interim image: cheap to decode, deliver immediately so
+                // the card paints fast.
+                completion(CardState(asset: asset, image: img), true)
+            } else {
+                // Full image: force-decode off the main thread. PHImageManager
+                // hands back an undecoded image, so the first Image(uiImage:) /
+                // UIImageView render would otherwise decode the full bitmap ON
+                // THE MAIN THREAD (the 200-500ms swipe stalls we measured).
+                // prepareForDisplay does the decode on a background queue.
+                img.prepareForDisplay { decoded in
+                    DispatchQueue.main.async {
+                        completion(CardState(asset: asset, image: decoded ?? img), false)
+                    }
+                }
+            }
         }
     }
 
@@ -1019,6 +1057,11 @@ struct RetroCleanView: View {
 
     /// Pre-download Live Photos for the next cards so they're instant on arrival.
     private func warmUpcomingLivePhotos() {
+        // Speculative iCloud prefetch must honor the user's network preference.
+        // Retro shows old (offloaded) photos, so without this guard every swipe
+        // kicks off high-quality Live Photo downloads that starve the visible
+        // card's still-image fetch for bandwidth/decode — the source of the jank.
+        guard prefetchAllowedNow else { return }
         let upcoming = buffer.prefix(6).map(\.asset)
             .filter { $0.mediaSubtypes.contains(.photoLive) }
         var warmed = 0
@@ -1314,12 +1357,12 @@ struct RetroCleanView: View {
 
     func syncNoteForCurrent() {
         guard let asset = activeCard?.asset else { currentNote = ""; return }
-        currentNote = tagCache[asset.localIdentifier]?.note ?? ""
+        currentNote = effectiveNote(asset.localIdentifier) ?? ""
     }
 
     func hasNoteForCurrentAsset() -> Bool {
         guard let asset = activeCard?.asset else { return false }
-        return tagCache[asset.localIdentifier]?.note?.isEmpty == false
+        return effectiveNote(asset.localIdentifier)?.isEmpty == false
     }
 
     // MARK: - Share
@@ -1541,7 +1584,7 @@ struct RetroCleanView: View {
         guard !isPreparingShareImage else { return }
         guard let asset = activeCard?.asset else { return }
 
-        let note = tagCache[asset.localIdentifier]?.note ?? ""
+        let note = effectiveNote(asset.localIdentifier) ?? ""
         guard !note.isEmpty else {
             shareOriginalImage()
             return
@@ -1657,20 +1700,34 @@ struct RetroCleanView: View {
 
 
     // MARK: - DB
+    //
+    // Tag edits made while swiping are accumulated here as DETACHED PhotoTag
+    // scratch objects (created but never inserted into the context, so mutating
+    // them dirties nothing). They're flushed to modelContext in ONE batch when
+    // the user pauses / leaves / backgrounds. Writing the context on every swipe
+    // dirties it and forces every live @Query (ContentView, LibraryView,
+    // PhotoGridView — all alive behind Retro because you reached it through the
+    // grid) to re-fetch and re-run their bodies on the main thread. That cascade
+    // is the 250-500ms per-swipe stall we measured; batching collapses it to one
+    // hit per pause/exit instead of one per swipe.
+    private func effectiveNote(_ assetID: String) -> String? {
+        if let pending = pendingTags[assetID] { return pending.note }
+        return tagCache[assetID]?.note
+    }
+
     func upsertTag(assetID: String, mutate: (PhotoTag) -> Void) {
-        let tag: PhotoTag
-        if let existing = tagCache[assetID] {
-            tag = existing
+        // Seed a detached scratch with the current effective state so a
+        // status-only edit preserves the note (and vice-versa).
+        let scratch: PhotoTag
+        if let pending = pendingTags[assetID] {
+            scratch = pending
         } else {
-            tag = PhotoTag(assetID: assetID, status: "pending")
-            tag.createdAt = Date()
-            modelContext.insert(tag)
+            scratch = PhotoTag(assetID: assetID, status: tagCache[assetID]?.status ?? "pending")
+            scratch.note = tagCache[assetID]?.note
         }
-        mutate(tag)
-        tagCache[assetID] = tag
-        // Don't save synchronously on every swipe — coalesce into one debounced
-        // write. In-memory changes are immediately visible to other views on the
-        // same container; flushPendingTagSave() guarantees durability on exit.
+        scratch.createdAt = Date()
+        mutate(scratch)
+        pendingTags[assetID] = scratch
         scheduleTagSave()
     }
 
@@ -1678,16 +1735,38 @@ struct RetroCleanView: View {
         pendingTagSave?.cancel()
         let work = DispatchWorkItem {
             self.pendingTagSave = nil
-            try? self.modelContext.save()
+            self.commitPendingTags()
         }
         pendingTagSave = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+        // Long debounce: a burst of swipes keeps rescheduling this, so the
+        // context is only dirtied once the user genuinely pauses.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
     }
 
     private func flushPendingTagSave() {
-        guard pendingTagSave != nil else { return }
         pendingTagSave?.cancel()
         pendingTagSave = nil
+        commitPendingTags()
+    }
+
+    /// Apply every accumulated edit to the context in one batch and save once.
+    /// This is the only place Retro dirties the shared context.
+    private func commitPendingTags() {
+        guard !pendingTags.isEmpty else { return }
+        for (id, scratch) in pendingTags {
+            let tag: PhotoTag
+            if let existing = tagCache[id] {
+                tag = existing
+            } else {
+                tag = PhotoTag(assetID: id, status: scratch.status)
+                modelContext.insert(tag)
+            }
+            tag.status = scratch.status
+            tag.note = scratch.note
+            tag.createdAt = scratch.createdAt
+            tagCache[id] = tag
+        }
+        pendingTags.removeAll()
         try? modelContext.save()
     }
 }

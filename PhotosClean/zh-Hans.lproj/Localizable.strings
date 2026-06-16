@@ -221,7 +221,7 @@
 
 /* Grid */
 "grid.filter.all" = "全部";
-"grid.filter.ai" = "AI";
+"grid.filter.ai" = "整理";
 "grid.ai.append500" = "追加识别（+500）";
 "grid.ai.progress.blurry" = "正在识别模糊… %d-%d/%d";
 "grid.ai.progress.duplicates" = "正在识别重复… %d-%d/%d";
@@ -246,7 +246,7 @@
 /* Daily Quota Upgrade Card */
 "quota.title" = "今日免费额度已用完";
 "quota.subtitle" = "每天可以免费整理 36 张照片\n升级后不再有数量限制";
-"quota.indie" = "一款独立开发的产品，希望带来最纯粹的产品体验\n你的支持是最大的动力";
+"quota.indie" = "一款独立开发的产品\n你的支持是最大的动力";
 
 "quota.cta" = "了解会员";
 

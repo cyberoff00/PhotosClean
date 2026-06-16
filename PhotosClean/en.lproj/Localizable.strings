@@ -251,7 +251,7 @@
 
 /* Grid */
 "grid.filter.all" = "All";
-"grid.filter.ai" = "AI";
+"grid.filter.ai" = "Tidy";
 "grid.ai.append500" = "Append Scan (+500)";
 "grid.ai.progress.blurry" = "Identifying blurry... %d-%d/%d";
 "grid.ai.progress.duplicates" = "Identifying duplicates... %d-%d/%d";

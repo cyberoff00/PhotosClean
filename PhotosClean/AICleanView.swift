@@ -87,11 +87,6 @@ struct AICleanResultsView: View {
     /// The in-flight scan, kept so onDisappear can cancel it.
     @State private var loadTask: Task<Void, Never>? = nil
 
-    private let columns = [
-        GridItem(.flexible(), spacing: 2),
-        GridItem(.flexible(), spacing: 2),
-        GridItem(.flexible(), spacing: 2)
-    ]
     private let blurCIContext = CIContext(options: nil)
     private let blurRenderColorSpace = CGColorSpaceCreateDeviceRGB()
 
@@ -118,23 +113,28 @@ struct AICleanResultsView: View {
                 .padding(.top, 24)
 
             } else {
-                ScrollView {
-                    LazyVGrid(columns: columns, spacing: 2) {
-                        ForEach(assets, id: \.localIdentifier) { asset in
-                            let id = asset.localIdentifier
-                            AssetThumbnailView(asset: asset, noteText: nil, isSearchMatched: false)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    navigationSnapshot = assets
-                                    selected = SelectedPhoto(id: id)
-                                }
+                GeometryReader { geo in
+                    let metrics = Layout.gridMetrics(forWidth: geo.size.width)
+                    ScrollView {
+                        LazyVGrid(columns: metrics.columns, spacing: 2) {
+                            ForEach(assets, id: \.localIdentifier) { asset in
+                                let id = asset.localIdentifier
+                                AssetThumbnailView(asset: asset, noteText: nil, isSearchMatched: false)
+                                    .frame(width: metrics.side, height: metrics.side)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        navigationSnapshot = assets
+                                        selected = SelectedPhoto(id: id)
+                                    }
+                            }
                         }
+                        .padding(.horizontal, 2)
+                        .frame(maxWidth: .infinity, alignment: .center)
                     }
-                    .padding(.horizontal, 2)
+                    // Optional manual re-scan; the automatic scan only runs once
+                    // per push (see onAppear guard below).
+                    .refreshable { await refresh() }
                 }
-                // Optional manual re-scan; the automatic scan only runs once
-                // per push (see onAppear guard below).
-                .refreshable { await refresh() }
             }
         }
         .navigationTitle(category.title)

@@ -16,25 +16,37 @@ struct PhotosCleanApp: App {
     @StateObject private var storageStats = StorageStats()
     @StateObject private var ratingPrompt = RatingPrompt()
 
+    // ⚠️ 诊断开关：true = 关闭 CloudKit、只用本地存储，用来确认 retro/grid 的
+    // 主线程卡顿是不是 NSPersistentCloudKitContainer 的镜像处理造成的。
+    // 确认后改回 false。
+    static let forceLocalForDiagnostics = false
+
     // 初始化共享 ModelContainer（三级 fallback，确保 app 至少能打开）
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([PhotoTag.self])
 
         // 1) 优先：CloudKit + App Group
-        let cloudConfig = ModelConfiguration(
+        if !PhotosCleanApp.forceLocalForDiagnostics {
+            let cloudConfig = ModelConfiguration(
+                schema: schema,
+                isStoredInMemoryOnly: false,
+                groupContainer: .identifier("group.com.claire.TastyTidy"),
+                cloudKitDatabase: .private("iCloud.com.claire.tastytidy")
+            )
+            do {
+                return try ModelContainer(for: schema, configurations: [cloudConfig])
+            } catch {
+                print("⚠️ CloudKit ModelContainer failed, falling back to local:", error)
+            }
+        }
+
+        // 2) Fallback：纯本地存储（同一个 App Group 存储，只是不开 CloudKit 镜像）
+        let localConfig = ModelConfiguration(
             schema: schema,
             isStoredInMemoryOnly: false,
             groupContainer: .identifier("group.com.claire.TastyTidy"),
-            cloudKitDatabase: .private("iCloud.com.claire.tastytidy")
+            cloudKitDatabase: .none
         )
-        do {
-            return try ModelContainer(for: schema, configurations: [cloudConfig])
-        } catch {
-            print("⚠️ CloudKit ModelContainer failed, falling back to local:", error)
-        }
-
-        // 2) Fallback：纯本地存储
-        let localConfig = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false, cloudKitDatabase: .none)
         do {
             return try ModelContainer(for: schema, configurations: [localConfig])
         } catch {

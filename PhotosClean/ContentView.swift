@@ -93,6 +93,11 @@ struct ContentView: View {
     /// from enqueuing multiple PHPhotoLibrary delete requests whose system
     /// confirmation dialogs would otherwise stack up and flush on next launch.
     @State private var isCleanupDeleting = false
+    /// Set true the instant we actually fire performChanges (i.e. the system
+    /// delete confirmation is on its way). The watchdog below uses this to tell
+    /// "still stuck waiting to present" apart from "user is staring at the system
+    /// dialog" — it only unsticks the former.
+    @State private var cleanupChangesStarted = false
 
     // MARK: Pending-release cache
     // Recomputed only when redCount or storageStats precise sizes change.
@@ -165,14 +170,14 @@ struct ContentView: View {
     @State private var isPreparingShare = false
 
     // MARK: UI layout
-    private let cardWidth = UIScreen.main.bounds.width - 40
-    private var cardHeight: CGFloat { (UIScreen.main.bounds.width - 40) * 4 / 3 }
+    private var cardWidth: CGFloat { Layout.cardWidth(inset: 40) }
+    private var cardHeight: CGFloat { Layout.cardWidth(inset: 40) * 4 / 3 }
 
     // Swipe config
     private var swipeThresholdX: CGFloat { 120 }
     private var swipeThresholdY: CGFloat { 120 }
-    private var outDistanceX: CGFloat { 900 }
-    private var outDistanceY: CGFloat { 1100 }
+    private var outDistanceX: CGFloat { Layout.swipeOutDistanceX }
+    private var outDistanceY: CGFloat { Layout.swipeOutDistanceY }
 
     private var currentCardOffset: CGSize {
         CGSize(width: dragOffset.width + settleOffset.width,
@@ -306,14 +311,15 @@ struct ContentView: View {
     private let bottomButtonsLiftFromTab: CGFloat = 58
 
     private var cardStageHeight: CGFloat {
-        let cardW = UIScreen.main.bounds.width - cardHorizontalInset
+        let cardW = Layout.cardWidth(inset: cardHorizontalInset)
         let cardH = cardW * 4 / 3
         // cardStackView uses .padding(20)
         return cardH + 40
     }
 
-    // 32pt thumbnails + small vertical padding.
-    private let filmstripStageHeight: CGFloat = 46
+    // 32pt thumbnails + small vertical padding. A touch shorter on compact
+    // phones so the card stage gets more room.
+    private var filmstripStageHeight: CGFloat { Layout.isCompactHeight ? 40 : 46 }
     var body: some View {
         ZStack {
             Color(.systemBackground).ignoresSafeArea()
@@ -323,8 +329,8 @@ struct ContentView: View {
                 // photo switching / loading.
                 headerView
                     .padding(.horizontal, 16)
-                    .padding(.top, 42)
-                    .padding(.bottom, 10)
+                    .padding(.top, Layout.isCompactHeight ? 10 : 42)
+                    .padding(.bottom, Layout.isCompactHeight ? 4 : 10)
 
                 // ✅ NEW: top lightweight banner (auto dismiss)
                 if showTopBanner {
@@ -397,11 +403,29 @@ struct ContentView: View {
 
             // Bottom action buttons should never cover the tab bar.
             // Using a safe-area inset keeps layout stable and user-friendly.
+            //
+            // Short phones (iPhone SE / mini): there isn't enough vertical room
+            // for the card *and* these buttons above the tab bar, so we drop the
+            // buttons entirely — left/right/up swipes (and the on-card edge
+            // buttons) still cover delete / keep / maybe. On taller phones we
+            // keep them but hide them whenever there's no card to act on (the
+            // "This day is done" / loading states), so they never float over the
+            // tab bar in an empty stage.
+            // Short phones (iPhone SE / mini): drop the swipe circles entirely so
+            // the card can be larger — delete / keep / maybe stay available via
+            // swipes and the on-card edge buttons. Taller phones & iPad keep the
+            // buttons, hidden only when there's no card to act on. The storage
+            // badge no longer lives here (it's a chip on the card corner now).
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                bottomButtons
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 4)
-                    .padding(.bottom, bottomButtonsLiftFromTab)
+                if !Layout.isCompactHeight {
+                    bottomButtons
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 4)
+                        .padding(.bottom, bottomButtonsLiftFromTab)
+                        .opacity(hasTodayCards ? 1 : 0)
+                        .allowsHitTesting(hasTodayCards)
+                        .animation(.none, value: hasTodayCards)
+                }
             }
 
             if showNoteEditor { noteEditorOverlay }
@@ -634,6 +658,15 @@ struct ContentView: View {
                 )
             }
         }
+        // Storage/goal progress sits as a small chip in the card's bottom-left
+        // corner instead of taking a full row above the tab bar — that lets the
+        // card itself be larger. Pinned to the stack frame so it stays put while
+        // a card swipes out.
+        .overlay(alignment: .bottomLeading) {
+            stageStatusBadge
+                .padding(10)
+                .allowsHitTesting(false)
+        }
     }
 
     private var swipeHintOverlay: some View {
@@ -816,10 +849,13 @@ struct ContentView: View {
 
                 // One-tap cleanup: actually delete everything marked for deletion,
                 // so users don't need to dig into the "To Delete" folder. Appears
-                // only once something has been left-swiped.
-                if redCount > 0 {
-                    cleanupTrashButton
-                }
+                // only once something has been left-swiped. Opacity-gated (not a
+                // structural `if`) and animation-disabled so swiping a card can't
+                // capture it in the swipe-out transaction and make it flash.
+                cleanupTrashButton
+                    .opacity(redCount > 0 ? 1 : 0)
+                    .allowsHitTesting(redCount > 0)
+                    .animation(.none, value: redCount > 0)
             }
 
             HStack(spacing: 12) {
@@ -909,6 +945,9 @@ struct ContentView: View {
                 }
                 .opacity(undoStack.isEmpty ? 0 : 1)
                 .disabled(undoStack.isEmpty || isAnimatingOut || isUndoRestoring)
+                // Same anti-flash treatment as the cleanup button: never let the
+                // swipe-out animation transaction animate the empty→visible flip.
+                .animation(.none, value: undoStack.isEmpty)
             }
             .padding(.top, 2)
         }
@@ -999,14 +1038,9 @@ struct ContentView: View {
     private var bottomButtons: some View {
         HStack(spacing: 40) {
             // Gray, not red: left-swipe / this button only *marks* for deletion.
-            // The actual delete is the red trash in the header.
+            // The actual delete is the red trash in the header. (The storage/goal
+            // badge now lives in the card's bottom-left corner, not here.)
             ActionButton(icon: "trash.fill", color: .gray) { triggerButtonSwipe(status: "delete") }
-                .overlay(alignment: .top) {
-                    stageStatusBadge
-                        .fixedSize()
-                        .alignmentGuide(.top) { d in d[.bottom] + 8 }
-                        .allowsHitTesting(false)
-                }
             ActionButton(icon: "clock.fill", color: .yellow) { triggerButtonSwipe(status: "maybe") }
             ActionButton(icon: "heart.fill", color: .green) { triggerButtonSwipe(status: "keep") }
         }
@@ -1053,8 +1087,8 @@ struct ContentView: View {
             .foregroundColor(color)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(color.opacity(0.12))
-            .clipShape(Capsule())
+            // Material backing so it stays readable sitting over a photo.
+            .background(.ultraThinMaterial, in: Capsule())
         } else if redCount > 0 {
             HStack(spacing: 4) {
                 Image(systemName: "trash")
@@ -1065,8 +1099,7 @@ struct ContentView: View {
             .foregroundColor(.red)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(Color.red.opacity(0.12))
-            .clipShape(Capsule())
+            .background(.ultraThinMaterial, in: Capsule())
         }
     }
 
@@ -1100,14 +1133,39 @@ struct ContentView: View {
             latest[tag.assetID] = (tag.status, tag.createdAt)
         }
         let ids = latest.compactMap { $0.value.status == "delete" ? $0.key : nil }
-        guard !ids.isEmpty else { return }
+        cleanLog("[Today] tapped cleanup — ids=\(ids.count) isCleanupDeleting=\(isCleanupDeleting)")
+        guard !ids.isEmpty else { cleanLog("[Today] abort: no ids"); return }
         // Re-entrancy guard: one delete request at a time. Without this, repeated
         // taps (while iOS defers its delete confirmation) queue up dozens of
         // requests that all surface at once on the next launch.
-        guard !isCleanupDeleting else { return }
+        guard !isCleanupDeleting else { cleanLog("[Today] abort: already deleting (button locked)"); return }
         isCleanupDeleting = true
+        // Safety valve: if we somehow never reach performChanges (UIKit dropped
+        // the presentation, the scene state misreported, a permission callback
+        // never returned…) the button would stay grey forever. Unstick it after
+        // a few seconds — but only while we're still waiting to present; once the
+        // system dialog is actually up (cleanupChangesStarted) we leave it to the
+        // performChanges completion so we never yank the lock mid-deletion.
+        cleanupChangesStarted = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+            if isCleanupDeleting && !cleanupChangesStarted {
+                isCleanupDeleting = false
+            }
+        }
+        // Hard safety net: on iPad the system "Delete N Photos?" confirmation can
+        // be dropped without ever calling performChanges' completion (the dialog
+        // is presented into a transient state and silently discarded), which left
+        // the button disabled forever — the "一键清理卡死" report. Re-enable
+        // unconditionally after a long delay so the feature can never get stuck.
+        // Harmless if a real deletion is still in flight: the completion handler
+        // also clears this flag, and re-deleting already-deleted assets is a no-op.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+            if isCleanupDeleting { cleanLog("[Today] HARD watchdog (25s) fired — button was still locked, unsticking. Dialog likely never completed.") ; isCleanupDeleting = false }
+        }
 
+        cleanLog("[Today] requesting write access… status=\(PHPhotoLibrary.authorizationStatus(for: .readWrite).rawValue)")
         PhotoLibraryAuth.requestWriteAccess { granted in
+            cleanLog("[Today] write access result granted=\(granted)")
             guard granted else {
                 isCleanupDeleting = false
                 // A restricted user has no Photos toggle in Settings, so route
@@ -1124,12 +1182,14 @@ struct ContentView: View {
     }
 
     private func performCleanupDelete(ids: [String]) {
+        cleanLog("[Today] performCleanupDelete — fetching \(ids.count) assets off main…")
         // fetchAssets + enumerate is synchronous Photos I/O — keep it off main.
         DispatchQueue.global(qos: .userInitiated).async {
             let result = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
             var array: [PHAsset] = []
             array.reserveCapacity(result.count)
             result.enumerateObjects { a, _, _ in array.append(a) }
+            cleanLog("[Today] fetched \(result.count) assets, hopping to main for runWhenReady")
 
             DispatchQueue.main.async {
                 // Fire the delete (and thus iOS's confirmation) only when the UI
@@ -1137,10 +1197,13 @@ struct ContentView: View {
                 // Otherwise UIKit drops the system dialog (nothing happens) or holds
                 // it to the next launch (a pile of dialogs). This waits until ready.
                 ForegroundGate.runWhenReady {
+                    cleanupChangesStarted = true
                     let bytes = storageStats.totalBestSize(for: array)
+                    cleanLog("[Today] ▶︎ calling PHPhotoLibrary.performChanges (system Delete dialog should appear NOW)")
                     PHPhotoLibrary.shared().performChanges({
                         PHAssetChangeRequest.deleteAssets(result)
-                    }) { success, _ in
+                    }) { success, error in
+                        cleanLog("[Today] ◀︎ performChanges COMPLETION success=\(success) error=\(error?.localizedDescription ?? "nil")")
                         DispatchQueue.main.async {
                             isCleanupDeleting = false
                             // success=false means the user cancelled the system delete dialog.

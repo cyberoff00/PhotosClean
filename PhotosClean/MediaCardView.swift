@@ -36,8 +36,8 @@ struct MediaCardView: View {
     @State private var isVideoLoaded = false
     @State private var isVideoReady = false
 
-    private let cardWidth = UIScreen.main.bounds.width - 40
-    private var cardHeight: CGFloat { (UIScreen.main.bounds.width - 40) * 4 / 3 }
+    private var cardWidth: CGFloat { Layout.cardWidth(inset: 40) }
+    private var cardHeight: CGFloat { Layout.cardWidth(inset: 40) * 4 / 3 }
 
     private var isHeavyPhase: Bool { isAnimatingOut || isDragging }
 

@@ -60,6 +60,10 @@ struct PhotoGridView: View {
     /// enqueuing multiple PHPhotoLibrary delete requests whose system
     /// confirmation dialogs would otherwise stack up and flush on next launch.
     @State private var isDeletingPhotos = false
+    /// True once performChanges actually fires (system delete dialog incoming).
+    /// Lets the watchdog tell "stuck waiting to present" from "user deciding in
+    /// the system dialog" and only unstick the former. See startDeleteWatchdog().
+    @State private var deleteChangesStarted = false
     @State private var cachedYearsMonths: [String] = []
     // 预计算 assetID → (year, month)。loadPhotos 时一次构建，避免在 filter 热路径里
     // 反复调 Calendar.dateComponents（ICU 很慢）。
@@ -126,12 +130,6 @@ struct PhotoGridView: View {
     // ✅ 与 startPrefetching 配对的 stop：记录上一批已 start 的 assets
     @State private var prefetchedAssets: [PHAsset] = []
 
-    let columns = [
-        GridItem(.flexible(), spacing: 2),
-        GridItem(.flexible(), spacing: 2),
-        GridItem(.flexible(), spacing: 2)
-    ]
-
     private var filteredAssets: [PHAsset] { filteredAssetsCache }
 
     private var isLibraryView: Bool {
@@ -154,6 +152,7 @@ struct PhotoGridView: View {
 
     var body: some View {
         searchableContentRoot
+            .trackFrameHitches("grid")
             .navigationTitle(title)
             .toolbar { trailingToolbar }
             .alert("grid.photoAuth.title".localized, isPresented: $showingPhotoAuthAlert) {
@@ -171,12 +170,14 @@ struct PhotoGridView: View {
                 stopPrefetchingThumbnails()
             }
             .onChange(of: allTags) { _, _ in
-                rebuildTagMaps()
-                // applyStatusFilterFromSnapshot updates `assets` AND calls recomputeFilteredAssets
-                // in one shot, so we do NOT need a separate onChange(of: assets) listener.
-                applyStatusFilterFromSnapshot()
-                recomputePendingDeleteCache()
-                storageStats.precacheSizes(for: pendingDeleteAssetsCache)
+                measureMain("grid.onChange(allTags)") {
+                    rebuildTagMaps()
+                    // applyStatusFilterFromSnapshot updates `assets` AND calls recomputeFilteredAssets
+                    // in one shot, so we do NOT need a separate onChange(of: assets) listener.
+                    applyStatusFilterFromSnapshot()
+                    recomputePendingDeleteCache()
+                    storageStats.precacheSizes(for: pendingDeleteAssetsCache)
+                }
             }
             // 精确体积是后台异步算出来的；节流刷新一次缓存的字节数即可。
             .onReceive(storageStats.$preciseSizes.dropFirst().throttle(for: .milliseconds(300), scheduler: RunLoop.main, latest: true)) { _ in
@@ -203,6 +204,7 @@ struct PhotoGridView: View {
             .navigationDestination(item: $selected) { sel in
                 let list = navigationSnapshot.isEmpty ? filteredAssets : navigationSnapshot
                 let idx = list.firstIndex(where: { $0.localIdentifier == sel.id }) ?? 0
+                let _ = cleanLog("[Nav] building detail view isLibrary=\(isLibraryView) listCount=\(list.count) idx=\(idx)")
                 if isLibraryView {
                     LibraryCleanView(assets: list, initialIndex: idx)
                 } else {
@@ -224,8 +226,9 @@ struct PhotoGridView: View {
         }
     }
 
-    private var gridScrollBody: some View {
-        ScrollView {
+    private func gridScrollBody(containerWidth: CGFloat) -> some View {
+        let metrics = Layout.gridMetrics(forWidth: containerWidth)
+        return ScrollView {
             if isLoading {
                 ProgressView().padding(.top, 50)
             } else if photoAccessDenied {
@@ -246,12 +249,13 @@ struct PhotoGridView: View {
                 )
                 .padding(.top, 50)
             } else {
-                LazyVGrid(columns: columns, spacing: 2) {
+                LazyVGrid(columns: metrics.columns, spacing: 2) {
                     ForEach(filteredAssets, id: \.localIdentifier) { asset in
-                        gridCell(for: asset)
+                        gridCell(for: asset, side: metrics.side)
                     }
                 }
                 .padding(.horizontal, 2)
+                .frame(maxWidth: .infinity, alignment: .center)
             }
         }
     }
@@ -262,7 +266,7 @@ struct PhotoGridView: View {
         proxy: ScrollViewProxy
     ) -> some View {
         if isSelectionMode {
-            gridScrollBody
+            gridScrollBody(containerWidth: outerGeo.size.width)
                 .scrollDisabled(isDragSelecting)
                 .coordinateSpace(name: "gridSpace")
                 // 写入引用类型 holder，不触发 body 重算（滚动时 frame 每帧都在变）。
@@ -277,7 +281,7 @@ struct PhotoGridView: View {
         } else {
             // ✅ Non-selection: plain ScrollView, NO scrollDisabled, NO gestures.
             // This fixes older iOS where SwiftUI gesture arbitration blocks scrolling.
-            gridScrollBody
+            gridScrollBody(containerWidth: outerGeo.size.width)
         }
     }
 
@@ -414,7 +418,7 @@ struct PhotoGridView: View {
             .disabled(aiIsScanning)
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: "sparkles")
+                Image(systemName: "line.3.horizontal.decrease.circle")
                 if let selectedAICategory {
                     Text(selectedAICategory.title).font(.caption)
                 } else {
@@ -540,7 +544,7 @@ struct PhotoGridView: View {
     }
 
     @ViewBuilder
-    private func gridCell(for asset: PHAsset) -> some View {
+    private func gridCell(for asset: PHAsset, side: CGFloat) -> some View {
         let id = asset.localIdentifier
         let note = noteByAssetID[id]
         // 高亮与过滤统一走 debouncedSearchText，避免输入瞬间两者不同步。
@@ -551,6 +555,7 @@ struct PhotoGridView: View {
             let isSelected = selectedIDs.contains(id)
             ZStack(alignment: .topTrailing) {
                 AssetThumbnailView(asset: asset, noteText: note, isSearchMatched: matchesSearch)
+                    .frame(width: side, height: side)
                     .overlay(
                         Rectangle()
                             .strokeBorder(isSelected ? Color.accentColor : Color.clear, lineWidth: 3)
@@ -568,9 +573,11 @@ struct PhotoGridView: View {
         } else {
             // Normal mode: lightweight, no overlays, no geometry tracking
             AssetThumbnailView(asset: asset, noteText: note, isSearchMatched: matchesSearch)
+                .frame(width: side, height: side)
                 .contentShape(Rectangle())
                 .id(id)
                 .onTapGesture {
+                    cleanLog("[Nav] grid cell tapped → snapshot=\(filteredAssets.count) opening detail id=\(id)")
                     navigationSnapshot = filteredAssets
                     selected = SelectedPhoto(id: id)
                 }
@@ -763,7 +770,7 @@ struct PhotoGridView: View {
 
     private func gridThumbnailTargetSize() -> CGSize {
         let scale = UIScreen.main.scale
-        let gridSide = ((UIScreen.main.bounds.width - 8) / 3.0).rounded(.up)
+        let gridSide = Layout.gridCellSide(spacing: 2)
         let pixelSide = max(gridSide * scale, 180)
         return CGSize(width: pixelSide, height: pixelSide)
     }
@@ -949,12 +956,16 @@ struct PhotoGridView: View {
     }
 
     func deleteMarkedPhotos() {
-        guard !isDeletingPhotos else { return }
+        cleanLog("[Grid] tapped deleteAll — isDeletingPhotos=\(isDeletingPhotos) pending=\(pendingDeleteAssetsCache.count)")
+        guard !isDeletingPhotos else { cleanLog("[Grid] abort: already deleting (button locked)"); return }
         // 与菜单上的 "(N)" 用同一份缓存，保证按钮数字 == 实际删除数。
         let deleteIDs = pendingDeleteAssetsCache.map(\.localIdentifier)
-        guard !deleteIDs.isEmpty else { return }
+        guard !deleteIDs.isEmpty else { cleanLog("[Grid] abort: no ids"); return }
         isDeletingPhotos = true
+        startDeleteWatchdog()
+        cleanLog("[Grid] requesting write access… status=\(PHPhotoLibrary.authorizationStatus(for: .readWrite).rawValue)")
         PhotoLibraryAuth.requestWriteAccess { granted in
+            cleanLog("[Grid] write access result granted=\(granted)")
             guard granted else {
                 isDeletingPhotos = false
                 showingPhotoAuthAlert = true
@@ -969,6 +980,7 @@ struct PhotoGridView: View {
         let ids = Array(selectedIDs)
         guard !ids.isEmpty else { return }
         isDeletingPhotos = true
+        startDeleteWatchdog()
         PhotoLibraryAuth.requestWriteAccess { granted in
             guard granted else {
                 isDeletingPhotos = false
@@ -979,13 +991,37 @@ struct PhotoGridView: View {
         }
     }
 
+    /// Safety valve against the delete button getting stuck grey: if we never
+    /// reach performChanges (UIKit dropped the presentation, scene state
+    /// misreported, a permission callback never returned…) unstick the button a
+    /// few seconds later — but only while still waiting to present. Once the
+    /// system dialog is up (deleteChangesStarted) we leave the lock to the
+    /// performChanges completion so we never release it mid-deletion.
+    private func startDeleteWatchdog() {
+        deleteChangesStarted = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+            if isDeletingPhotos && !deleteChangesStarted {
+                isDeletingPhotos = false
+            }
+        }
+        // Hard safety net: on iPad the system "Delete N Photos?" confirmation can
+        // be dropped without ever calling performChanges' completion, leaving the
+        // button disabled forever (the "一键清理卡死" report). Re-enable
+        // unconditionally after a long delay so it can never get permanently stuck.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+            if isDeletingPhotos { cleanLog("[Grid] HARD watchdog (25s) fired — button still locked, unsticking. Dialog likely never completed."); isDeletingPhotos = false }
+        }
+    }
+
     private func performDelete(ids: [String], exitSelection: Bool) {
+        cleanLog("[Grid] performDelete — fetching \(ids.count) assets off main…")
         // fetchAssets + enumerateObjects 是同步 Photos I/O，整段挪到后台。
         DispatchQueue.global(qos: .userInitiated).async {
             let result = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
             var array: [PHAsset] = []
             array.reserveCapacity(result.count)
             result.enumerateObjects { a, _, _ in array.append(a) }
+            cleanLog("[Grid] fetched \(result.count) assets, hopping to main for runWhenReady")
 
             // StorageStats 是 @MainActor，size lookup 在主线程做（dict 查表，毫秒级）。
             DispatchQueue.main.async {
@@ -993,10 +1029,13 @@ struct PhotoGridView: View {
                 // 过渡」时才呈现得了。菜单收起、alert 消失、或场景非活跃的瞬间去调，
                 // UIKit 会丢掉系统框（什么都不弹）或压栈到下次启动。等到可呈现再弹。
                 ForegroundGate.runWhenReady {
+                    deleteChangesStarted = true
                     let bytes = storageStats.totalBestSize(for: array)
+                    cleanLog("[Grid] ▶︎ calling PHPhotoLibrary.performChanges (system Delete dialog should appear NOW)")
                     PHPhotoLibrary.shared().performChanges({
                         PHAssetChangeRequest.deleteAssets(result)
-                    }) { success, _ in
+                    }) { success, error in
+                        cleanLog("[Grid] ◀︎ performChanges COMPLETION success=\(success) error=\(error?.localizedDescription ?? "nil")")
                         DispatchQueue.main.async {
                             isDeletingPhotos = false
                             // success=false 一般意味着用户在系统弹窗里取消了删除确认。
@@ -1271,24 +1310,26 @@ struct AssetThumbnailView: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            GeometryReader { geo in
-                ZStack {
-                    Rectangle().fill(Color.gray.opacity(0.20))
+            // No per-cell GeometryReader: in a LazyVGrid that runs layout for
+            // every cell on every scroll frame and is a classic source of
+            // scroll jank. A square aspect-ratio container + scaledToFill/clip
+            // gives the identical visual without the per-frame layout cost.
+            ZStack {
+                Rectangle().fill(Color.gray.opacity(0.20))
 
-                    if let image = thumbnail {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: geo.size.width, height: geo.size.height)
-                            .clipped()
-                    } else {
-                        Image(systemName: "photo")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundColor(.secondary.opacity(0.6))
-                    }
+                if let image = thumbnail {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Image(systemName: "photo")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(.secondary.opacity(0.6))
                 }
             }
             .aspectRatio(1, contentMode: .fit)
+            .clipped()
+            .contentShape(Rectangle())
 
             // 便签角标（保留）
             if let note = noteText, !note.isEmpty {
@@ -1358,7 +1399,7 @@ struct AssetThumbnailView: View {
 
     private func gridThumbnailTargetSize() -> CGSize {
         let scale = UIScreen.main.scale
-        let gridSide = ((UIScreen.main.bounds.width - 8) / 3.0).rounded(.up)
+        let gridSide = Layout.gridCellSide(spacing: 2)
         let pixelSide = max(gridSide * scale, 180)
         return CGSize(width: pixelSide, height: pixelSide)
     }

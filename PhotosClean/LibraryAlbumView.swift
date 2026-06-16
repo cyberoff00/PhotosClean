@@ -158,10 +158,12 @@ struct LibraryCleanView: View {
             }
         }
         .onAppear {
-            buildTagCache()
-            preloadAroundIndex(force: true)
-            syncNoteForCurrent()
-            prepareMediaForCurrent()
+            cleanLog("[Lib] onAppear START assets=\(assets.count) index=\(index)")
+            measureMain("lib.onAppear.buildTagCache") { buildTagCache() }
+            measureMain("lib.onAppear.preloadAroundIndex") { preloadAroundIndex(force: true) }
+            measureMain("lib.onAppear.syncNote") { syncNoteForCurrent() }
+            measureMain("lib.onAppear.prepareMedia") { prepareMediaForCurrent() }
+            cleanLog("[Lib] onAppear DONE")
         }
         .onDisappear {
             stopAllMedia()

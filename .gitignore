@@ -2,4 +2,5 @@
 .derivedData/
 DerivedData/
 build/
-.claude/settings.local.json
+.claude/
+xcuserdata/
