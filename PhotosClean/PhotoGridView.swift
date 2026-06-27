@@ -22,6 +22,19 @@ private struct CellFramePreferenceKey: PreferenceKey {
     }
 }
 
+/// Size of the grid's scroll viewport, measured via a background reader. Used
+/// for the column math and the drag-select auto-scroll edge — read this way so
+/// the ScrollView is NOT wrapped in a root GeometryReader, which would stop
+/// UIKit from insetting content below the `.searchable` bar (the search field
+/// was overlapping the first row of photos).
+private struct GridViewportSizeKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        let next = nextValue()
+        if next != .zero { value = next }
+    }
+}
+
 /// Reference-type holder for cell frames. Writing frames into an @State dict
 /// would invalidate the body on every scroll frame while in selection mode;
 /// the drag-select hit testing only ever reads imperatively, so a plain class
@@ -114,6 +127,9 @@ struct PhotoGridView: View {
 
     // ✅ 自动滚动（更像系统相册：滑动选中时“往下滑=继续选下面的并自动翻页”）
     @State private var scrollViewHeight: CGFloat = 0
+    /// Live width of the scroll viewport for the column math. Starts at the
+    /// window width so the very first layout is already correct.
+    @State private var gridContainerWidth: CGFloat = 0
     @State private var autoScrollDirection: Int = 0 // -1 上，1 下，0 停止
     private let autoScrollEdge: CGFloat = 70
     private let autoScrollStep: Int = 2
@@ -154,6 +170,9 @@ struct PhotoGridView: View {
         searchableContentRoot
             .trackFrameHitches("grid")
             .navigationTitle(title)
+            // On short phones the large title + the always-on search bar eat too
+            // much height and crowd the grid, so collapse the title to inline.
+            .navigationBarTitleDisplayMode(Layout.isCompactHeight ? .inline : .large)
             .toolbar { trailingToolbar }
             .alert("grid.photoAuth.title".localized, isPresented: $showingPhotoAuthAlert) {
                 Button("grid.cancel".localized, role: .cancel) {}
@@ -214,20 +233,26 @@ struct PhotoGridView: View {
     }
 
     private var contentRoot: some View {
-        GeometryReader { outerGeo in
-            ScrollViewReader { proxy in
-                ZStack {
-                    gridBodyWithOptionalSelectionGesture(outerGeo: outerGeo, proxy: proxy)
-                    if aiIsScanning {
-                        aiProgressOverlay
-                    }
+        // No root GeometryReader here on purpose: wrapping the ScrollView in one
+        // breaks the automatic content inset under the `.searchable` bar (the
+        // search field would overlap the first row). The viewport size we need
+        // for the columns / auto-scroll is measured with a background reader on
+        // the ScrollView instead (see GridViewportSizeKey).
+        ScrollViewReader { proxy in
+            ZStack {
+                gridBodyWithOptionalSelectionGesture(proxy: proxy)
+                if aiIsScanning {
+                    aiProgressOverlay
                 }
             }
         }
     }
 
-    private func gridScrollBody(containerWidth: CGFloat) -> some View {
-        let metrics = Layout.gridMetrics(forWidth: containerWidth)
+    private var gridScrollBody: some View {
+        // Width starts at the window width so the first layout is already right,
+        // then tracks the real viewport via the background reader below.
+        let width = gridContainerWidth > 0 ? gridContainerWidth : Layout.windowWidth
+        let metrics = Layout.gridMetrics(forWidth: width)
         return ScrollView {
             if isLoading {
                 ProgressView().padding(.top, 50)
@@ -258,22 +283,32 @@ struct PhotoGridView: View {
                 .frame(maxWidth: .infinity, alignment: .center)
             }
         }
+        // Measure the viewport without a root GeometryReader (which would break
+        // the search-bar content inset). Drives the columns and auto-scroll.
+        .background(
+            GeometryReader { g in
+                Color.clear.preference(key: GridViewportSizeKey.self, value: g.size)
+            }
+        )
+        .onPreferenceChange(GridViewportSizeKey.self) { size in
+            if size.width > 0 { gridContainerWidth = size.width }
+            if size.height > 0 { scrollViewHeight = size.height }
+        }
     }
 
     @ViewBuilder
     private func gridBodyWithOptionalSelectionGesture(
-        outerGeo: GeometryProxy,
         proxy: ScrollViewProxy
     ) -> some View {
         if isSelectionMode {
-            gridScrollBody(containerWidth: outerGeo.size.width)
+            gridScrollBody
                 .scrollDisabled(isDragSelecting)
                 .coordinateSpace(name: "gridSpace")
                 // 写入引用类型 holder，不触发 body 重算（滚动时 frame 每帧都在变）。
                 .onPreferenceChange(CellFramePreferenceKey.self) { [cellFrameStore] frames in
                     cellFrameStore.frames = frames
                 }
-                .simultaneousGesture(dragSelectGesture(outerGeo: outerGeo))
+                .simultaneousGesture(dragSelectGesture())
                 .onReceive(autoScrollTimer) { _ in
                     guard isDragSelecting, autoScrollDirection != 0 else { return }
                     autoScrollTick(with: proxy)
@@ -281,15 +316,14 @@ struct PhotoGridView: View {
         } else {
             // ✅ Non-selection: plain ScrollView, NO scrollDisabled, NO gestures.
             // This fixes older iOS where SwiftUI gesture arbitration blocks scrolling.
-            gridScrollBody(containerWidth: outerGeo.size.width)
+            gridScrollBody
         }
     }
 
-    private func dragSelectGesture(outerGeo: GeometryProxy) -> some Gesture {
+    private func dragSelectGesture() -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 guard isSelectionMode else { return }
-                scrollViewHeight = outerGeo.size.height
                 if dragStartPoint == nil {
                     dragStartPoint = value.startLocation
                     dragMode = .undecided
@@ -380,6 +414,13 @@ struct PhotoGridView: View {
                 if filterStatus != "delete" {
                     aiFilterMenu
                     dateFilterMenu
+                    // Discoverable entry into multi-select. Long-pressing a photo
+                    // still works, but most people never find that; a visible
+                    // "Select" button matches the system Photos app.
+                    Button("grid.selection.select".localized) {
+                        isSelectionMode = true
+                    }
+                    .disabled(filteredAssets.isEmpty)
                 }
                 if filterStatus == "delete" {
                     deleteMenuButton
@@ -1309,14 +1350,17 @@ struct AssetThumbnailView: View {
     @State private var requestID: PHImageRequestID = PHInvalidImageRequestID
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            // No per-cell GeometryReader: in a LazyVGrid that runs layout for
-            // every cell on every scroll frame and is a classic source of
-            // scroll jank. A square aspect-ratio container + scaledToFill/clip
-            // gives the identical visual without the per-frame layout cost.
-            ZStack {
-                Rectangle().fill(Color.gray.opacity(0.20))
-
+        // Apple-Photos square cell. A Rectangle is the SIZING base: as a Shape it
+        // takes exactly the square the caller proposes (.frame(width:side,
+        // height:side)). The thumbnail goes on as an `.overlay`, so the
+        // scaledToFill image can never grow the base — `.clipped()` then trims its
+        // overflow to the cell. The previous `ZStack { … }.frame(maxHeight:.infinity)`
+        // let the fill image stretch the stack taller than the cell, so portrait
+        // photos overflowed and overlapped their neighbours (and the oversized
+        // draw made scrolling janky). Overlay + clip is the bulletproof pattern.
+        Rectangle()
+            .fill(Color.gray.opacity(0.20))
+            .overlay {
                 if let image = thumbnail {
                     Image(uiImage: image)
                         .resizable()
@@ -1327,38 +1371,32 @@ struct AssetThumbnailView: View {
                         .foregroundColor(.secondary.opacity(0.6))
                 }
             }
-            .aspectRatio(1, contentMode: .fit)
             .clipped()
             .contentShape(Rectangle())
-
             // 便签角标（保留）
-            if let note = noteText, !note.isEmpty {
-                Image(systemName: "note.text")
-                    .font(.caption2.bold())
-                    .foregroundColor(.white)
-                    .padding(4)
-                    .background(isSearchMatched ? Color.orange : Color.blue.opacity(0.8))
-                    .clipShape(Circle())
-                    .padding(5)
-            }
-
-            // 视频时长（保留）
-            if asset.mediaType == .video {
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        Text(formatDuration(asset.duration))
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(2)
-                            .background(Color.black.opacity(0.5))
-                            .cornerRadius(3)
-                    }
+            .overlay(alignment: .topLeading) {
+                if let note = noteText, !note.isEmpty {
+                    Image(systemName: "note.text")
+                        .font(.caption2.bold())
+                        .foregroundColor(.white)
+                        .padding(4)
+                        .background(isSearchMatched ? Color.orange : Color.blue.opacity(0.8))
+                        .clipShape(Circle())
+                        .padding(5)
                 }
-                .padding(4)
             }
-        }
+            // 视频时长（保留）
+            .overlay(alignment: .bottomTrailing) {
+                if asset.mediaType == .video {
+                    Text(formatDuration(asset.duration))
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(2)
+                        .background(Color.black.opacity(0.5))
+                        .cornerRadius(3)
+                        .padding(4)
+                }
+            }
         .onAppear { requestThumbnailIfNeeded() }
         .onChange(of: asset.localIdentifier) { _, _ in requestThumbnailIfNeeded() }
         .onDisappear {

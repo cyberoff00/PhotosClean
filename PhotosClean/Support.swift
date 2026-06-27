@@ -396,6 +396,34 @@ enum ForegroundGate {
         return chain.joined(separator: " > ")
     }
 
+    /// Short snapshot of every window scene's activation state, for cleanup
+    /// diagnostics. iOS 26 sometimes parks a plainly-visible app at
+    /// `.foregroundInactive`, which is one of the states in which the system
+    /// delete confirmation gets silently dropped.
+    static var activationStateDescription: String {
+        let states = UIApplication.shared.connectedScenes.compactMap { scene -> String? in
+            guard let s = scene as? UIWindowScene else { return nil }
+            switch s.activationState {
+            case .foregroundActive:   return "active"
+            case .foregroundInactive: return "inactive"
+            case .background:         return "background"
+            case .unattached:         return "unattached"
+            @unknown default:         return "unknown"
+            }
+        }
+        return "scene=[\(states.joined(separator: ","))]"
+    }
+
+    /// True only when a window scene is fully `.foregroundActive`. When a system
+    /// alert — like the Photos delete confirmation — is presented, the scene drops
+    /// to `.foregroundInactive`, so this returning false is our signal that "a
+    /// dialog is already on screen" and we must not fire another presentation.
+    static var foregroundSceneIsActive: Bool {
+        UIApplication.shared.connectedScenes.contains { scene in
+            (scene as? UIWindowScene)?.activationState == .foregroundActive
+        }
+    }
+
     /// True while any controller in the presentation chain is being presented or
     /// dismissed (Menu collapsing, alert/sheet appearing or going away).
     private static var isPresentationSettling: Bool {
@@ -407,66 +435,58 @@ enum ForegroundGate {
         }
     }
 
-    /// Whether a foreground-active scene exists to present on.
+    /// Whether a foreground scene exists that we can present a system dialog on.
     ///
     /// We deliberately do NOT use `UIApplication.shared.applicationState` here:
     /// since the multi-scene era it is unreliable, and on iOS 26 it frequently
     /// stays `.inactive` while the app is plainly in the foreground (e.g. the
-    /// beat right after a permission/system dialog dismisses). That made
-    /// `runWhenReady` time out and then wait forever on a `didBecomeActive`
-    /// notification that never arrives — so the system delete confirmation never
-    /// fired and the cleanup button stayed disabled forever. The scene's own
-    /// `activationState` is the source of truth.
-    private static var isForegroundActive: Bool {
-        UIApplication.shared.connectedScenes.contains {
-            ($0 as? UIWindowScene)?.activationState == .foregroundActive
+    /// beat right after a permission/system dialog dismisses).
+    ///
+    /// Crucially we accept BOTH `.foregroundActive` AND `.foregroundInactive`.
+    /// Earlier this required strictly `.foregroundActive`, but iOS 26 parks a
+    /// plainly-visible app at `.foregroundInactive` for long stretches — on
+    /// those devices `runWhenReady` timed out and then waited forever on a
+    /// `didBecomeActive` that never arrives (the scene is already foreground, so
+    /// it never "becomes active"), so the system delete confirmation never fired
+    /// and the cleanup button looked permanently dead. A foreground-inactive
+    /// scene can still present; only `.background`/`.unattached` cannot — and
+    /// the `isPresentationSettling` guard still keeps us out of mid-transitions.
+    private static var hasForegroundScene: Bool {
+        UIApplication.shared.connectedScenes.contains { scene in
+            guard let state = (scene as? UIWindowScene)?.activationState else { return false }
+            return state == .foregroundActive || state == .foregroundInactive
         }
     }
 
-    /// Runs `block` once the app is foreground-active and no presentation
+    /// Runs `block` once a foreground scene exists and no presentation
     /// transition is in flight, retrying frame by frame until ready (capped at
-    /// ~3s). If it never settles in time, falls back to firing on the next
-    /// activation so the work is deferred rather than dropped.
+    /// ~3s). If it never settles in time it fires anyway — a one-shot attempt
+    /// (which iOS itself can still defer) beats an infinite wait that leaves the
+    /// button dead.
     static func runWhenReady(_ block: @escaping () -> Void, remainingFrames: Int = 180) {
-        let active = isForegroundActive
+        let presentable = hasForegroundScene
         let settling = isPresentationSettling
         // Log only at entry and on state changes to avoid 180 lines of spam: log
         // the first frame, then every 30 frames while still waiting.
         if remainingFrames == 180 || remainingFrames % 30 == 0 {
-            cleanLog("runWhenReady frame=\(remainingFrames) active=\(active) settling=\(settling) chain=[\(presentationDescription)]")
+            cleanLog("runWhenReady frame=\(remainingFrames) presentable=\(presentable) settling=\(settling) chain=[\(presentationDescription)]")
         }
-        if active && !settling {
+        if presentable && !settling {
             cleanLog("runWhenReady → FIRING block (frame=\(remainingFrames))")
             block()
             return
         }
         guard remainingFrames > 0 else {
-            cleanLog("runWhenReady → TIMED OUT after 3s, falling back to runWhenActive (active=\(active))")
-            runWhenActive(block)
+            // Fail OPEN. The old fallback (runWhenActive) waited for a
+            // didBecomeActive that never arrives when the app is parked at
+            // .foregroundInactive, leaving the cleanup button permanently dead.
+            // Firing here at worst lets iOS decide whether to present.
+            cleanLog("runWhenReady → TIMED OUT after 3s — firing anyway (presentable=\(presentable), settling=\(settling))")
+            block()
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) {
             runWhenReady(block, remainingFrames: remainingFrames - 1)
-        }
-    }
-
-    /// Runs `block` immediately if foreground-active, otherwise exactly once the
-    /// next time the app becomes active.
-    static func runWhenActive(_ block: @escaping () -> Void) {
-        if isForegroundActive {
-            cleanLog("runWhenActive → firing immediately (active)")
-            block()
-            return
-        }
-        cleanLog("runWhenActive → NOT active, waiting for didBecomeActive notification (may never arrive)")
-        var token: NSObjectProtocol?
-        token = NotificationCenter.default.addObserver(
-            forName: UIApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            if let token { NotificationCenter.default.removeObserver(token) }
-            block()
         }
     }
 }

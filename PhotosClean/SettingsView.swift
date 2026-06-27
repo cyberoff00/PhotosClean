@@ -9,6 +9,9 @@ struct SettingsView: View {
     @State private var showFreedExplanation = false
     @State private var showFeedback = false
     @AppStorage("prewarm_use_cellular") private var prewarmUseCellular: Bool = true
+    #if DEBUG
+    @AppStorage("debug_simulate_delete_drop") private var debugSimulateDeleteDrop: Bool = false
+    #endif
 
     private let appStoreAppID = "6757628907"
     private let legalURL = URL(string: "https://seasoned-author-d9f.notion.site/TastyTidy-Privacy-Policy-Terms-of-Service-2db01b2ced5980e485e7ce0495e0b40e?pvs=143") ?? URL(string: "https://apple.com")!
@@ -96,6 +99,18 @@ struct SettingsView: View {
                     Label("feedback.title".localized, systemImage: "envelope")
                 }
             }
+
+            #if DEBUG
+            Section {
+                Toggle(isOn: $debugSimulateDeleteDrop) {
+                    Label("模拟删除框被丢弃(测重试)", systemImage: "ladybug")
+                }
+            } header: {
+                Text("DEBUG")
+            } footer: {
+                Text("开启后，一键清理的第一次会假装删除框被系统丢弃，约 4 秒后自动重试把删除框弹出来——用几张照片就能验证重试逻辑。")
+            }
+            #endif
 
             Section("settings.legal.section".localized) {
                 Link(destination: legalURL) {

@@ -172,6 +172,7 @@
 "sub.premium" = "开通高级版";
 
 "grid.selection.cancel" = "取消多选";
+"grid.selection.select" = "选择";
 
 "grid.deleteSelectedConfirm" = "确认彻底删除所选照片？";
 
@@ -195,6 +196,15 @@
 "random.empty.title" = "这一天已经刷完了";
 "random.empty.description" = "继续随机下一天，马上再来一组。";
 "random.empty.cta" = "再来一组";
+
+/* Second-pass review */
+"review.entry.heading" = "再筛一遍";
+"review.exhausted.title" = "所有照片都整理完了";
+"review.exhausted.description" = "已经没有未分类的照片了，从下面的分组里再筛一遍吧。";
+"review.exit" = "退出二次筛选";
+"review.backToRandom" = "回到随机";
+"review.done.title" = "这一组已重新筛选完";
+"review.done.description" = "你已经把这一组又过了一遍。";
 
 /* Common */
 "app.name" = "曲奇相片";

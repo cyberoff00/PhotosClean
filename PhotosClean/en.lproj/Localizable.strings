@@ -202,6 +202,7 @@
 "sub.terms" = "Terms of Service";
 
 "grid.selection.cancel" = "Cancel Select";
+"grid.selection.select" = "Select";
 
 "grid.deleteSelectedConfirm" = "Delete selected photos permanently?";
 
@@ -225,6 +226,15 @@
 "random.empty.title" = "This day is done";
 "random.empty.description" = "Pick another random day and keep going.";
 "random.empty.cta" = "Another batch";
+
+/* Second-pass review */
+"review.entry.heading" = "Take another pass";
+"review.exhausted.title" = "All caught up";
+"review.exhausted.description" = "Every photo is sorted. Take another pass over a pile below.";
+"review.exit" = "Exit second pass";
+"review.backToRandom" = "Back to random";
+"review.done.title" = "Pile re-sorted";
+"review.done.description" = "You've gone through this pile again.";
 
 /* Common */
 "app.name" = "Tastytidy";

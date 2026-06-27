@@ -8,6 +8,12 @@ import UIKit
 import Combine
 import UniformTypeIdentifiers
 
+/// Tiny reference box so a cleanup fire's timeout watchdog can see whether the
+/// performChanges completion already returned (closures capture it by reference).
+private final class CleanupFireState {
+    var completed = false
+}
+
 // MARK: - ContentView
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
@@ -55,6 +61,25 @@ struct ContentView: View {
     @State private var dateSourceMode: DateSourceMode = .random
     @State private var todayScope: TodayScope = .day
     @State private var randomPickedDay: Date? = nil
+
+    // MARK: Second-pass review
+    // When non-nil, the deck is fed from assets already tagged with this status
+    // ("keep" / "maybe" / "delete") instead of by date — a second pass over a
+    // pile the user sorted earlier. Swiping re-tags the asset as usual. Reached
+    // from the random empty state once the day's unmarked photos are exhausted.
+    @State private var reviewStatus: String? = nil
+    /// Cached bucket sizes shown on the re-review entry. Recomputed only when the
+    /// empty state appears, never per body frame.
+    @State private var reviewCounts: (keep: Int, maybe: Int, delete: Int) = (0, 0, 0)
+    /// True once a random pick finds no unmarked photos left anywhere in the
+    /// library — i.e. "Another batch" has nothing more to give. Only then does the
+    /// empty state offer a second pass over the Keep / Maybe / To-Delete piles.
+    /// A single empty *day* (the common case) leaves this false: rolling another
+    /// day still works.
+    @State private var randomExhausted: Bool = false
+    /// True once the current review bucket has no day left to roll — every photo in
+    /// it has been re-sorted this pass. Pivots the empty state to the other piles.
+    @State private var reviewExhausted: Bool = false
     /// The month shown when `todayScope == .month`. Lets the user browse any
     /// historical month, not just the current one.
     @State private var monthReference: Date = Date()
@@ -98,6 +123,10 @@ struct ContentView: View {
     /// "still stuck waiting to present" apart from "user is staring at the system
     /// dialog" — it only unsticks the former.
     @State private var cleanupChangesStarted = false
+    /// Guards the post-delete bookkeeping so a bounded retry (which can produce a
+    /// second success=true completion when an earlier dropped-looking dialog was
+    /// actually confirmed late) never double-counts cleaned bytes / rating signals.
+    @State private var cleanupFinalized = false
 
     // MARK: Pending-release cache
     // Recomputed only when redCount or storageStats precise sizes change.
@@ -511,6 +540,11 @@ struct ContentView: View {
             recomputePendingRelease()
             storageStats.notePendingProgress(pendingReleaseBytes)
         }
+        // Refresh the re-review bucket sizes only when the empty state surfaces,
+        // so the chips never iterate tagCache on a hot body frame.
+        .onChange(of: shouldShowStageEmptyState) { _, isEmpty in
+            if isEmpty { recomputeReviewCounts() }
+        }
         // When async precise-size results land, refresh the cache so the
         // "~" approx prefix can drop off without rerunning per body frame.
         // Throttled: size prefetch can publish many batches in a burst, and
@@ -809,7 +843,7 @@ struct ContentView: View {
                 self.paywallGate.showPaywall = true
             }
 
-            if self.todayPendingCount > 0 {
+            if self.reviewStatus == nil, self.todayPendingCount > 0 {
                 self.todayPendingCount -= 1
                 self.writeWidgetCountDebounced(self.todayPendingCount)
             }
@@ -863,6 +897,14 @@ struct ContentView: View {
                     // Single source entry: pick Random day / Today / This week /
                     // a specific month. Replaces the old separate scope + random pills.
                     Menu {
+                        if reviewStatus != nil {
+                            Button {
+                                exitReviewMode()
+                            } label: {
+                                Label("review.exit".localized, systemImage: "xmark.circle")
+                            }
+                            Divider()
+                        }
                         Button {
                             randomButtonTapped()
                         } label: {
@@ -911,8 +953,9 @@ struct ContentView: View {
                     }
 
                     // One-tap re-roll, kept only in random mode so changing days
-                    // stays a single tap instead of reopening the menu.
-                    if dateSourceMode == .random {
+                    // stays a single tap instead of reopening the menu. Hidden
+                    // during a second pass (the menu's exit handles leaving).
+                    if dateSourceMode == .random && reviewStatus == nil {
                         Button(action: randomButtonTapped) {
                             Group {
                                 if isPickingRandomDay {
@@ -956,6 +999,13 @@ struct ContentView: View {
 
     /// Name shown on the single source entry pill.
     private var currentSourceLabel: String {
+        // The recycle icon marks this as a second pass; the label names the pile.
+        switch reviewStatus {
+        case "keep":   return "library.favorites".localized
+        case "maybe":  return "library.maybe".localized
+        case "delete": return "library.toDelete".localized
+        default: break
+        }
         switch dateSourceMode {
         case .random:
             return "filter.random".localized
@@ -970,6 +1020,7 @@ struct ContentView: View {
 
     /// SF Symbol shown on the source entry pill, matching the current mode.
     private var currentSourceIcon: String {
+        if reviewStatus != nil { return "arrow.triangle.2.circlepath" }
         switch dateSourceMode {
         case .random:
             return "shuffle"
@@ -985,6 +1036,11 @@ struct ContentView: View {
     /// The date shown next to the entry: a day for day/random, the week's first
     /// day for week, and the year-month for month. Nil when no day is picked yet.
     private var currentSourceDateLabel: String? {
+        // Review rolls real days, same as random — show the day next to the pill.
+        if reviewStatus != nil {
+            guard let day = randomPickedDay else { return nil }
+            return formattedDay(day)
+        }
         switch dateSourceMode {
         case .random:
             guard let day = randomPickedDay else { return nil }
@@ -1147,6 +1203,7 @@ struct ContentView: View {
         // system dialog is actually up (cleanupChangesStarted) we leave it to the
         // performChanges completion so we never yank the lock mid-deletion.
         cleanupChangesStarted = false
+        cleanupFinalized = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
             if isCleanupDeleting && !cleanupChangesStarted {
                 isCleanupDeleting = false
@@ -1181,6 +1238,13 @@ struct ContentView: View {
         }
     }
 
+    /// Max times we (re-)present the system delete confirmation before giving up.
+    /// Kept low so the whole retry budget stays under the 25s HARD watchdog.
+    private static let cleanupMaxFireAttempts = 3
+    /// How long to wait for performChanges' completion before assuming iOS dropped
+    /// the confirmation and re-firing.
+    private static let cleanupFireTimeout: TimeInterval = 4.0
+
     private func performCleanupDelete(ids: [String]) {
         cleanLog("[Today] performCleanupDelete — fetching \(ids.count) assets off main…")
         // fetchAssets + enumerate is synchronous Photos I/O — keep it off main.
@@ -1199,40 +1263,130 @@ struct ContentView: View {
                 ForegroundGate.runWhenReady {
                     cleanupChangesStarted = true
                     let bytes = storageStats.totalBestSize(for: array)
-                    cleanLog("[Today] ▶︎ calling PHPhotoLibrary.performChanges (system Delete dialog should appear NOW)")
-                    PHPhotoLibrary.shared().performChanges({
-                        PHAssetChangeRequest.deleteAssets(result)
-                    }) { success, error in
-                        cleanLog("[Today] ◀︎ performChanges COMPLETION success=\(success) error=\(error?.localizedDescription ?? "nil")")
-                        DispatchQueue.main.async {
-                            isCleanupDeleting = false
-                            // success=false means the user cancelled the system delete dialog.
-                            guard success else { return }
-                            let idSet = Set(ids)
-
-                            for tag in allTags where idSet.contains(tag.assetID) {
-                                modelContext.delete(tag)
-                            }
-                            try? modelContext.save()
-
-                            for id in idSet { tagCache.removeValue(forKey: id) }
-                            // Physically deleted assets can no longer be undone —
-                            // drop them so undo can't write tags for dead assets.
-                            undoStack.removeAll { idSet.contains($0) }
-                            redCount = 0   // every delete-marked asset was just removed
-
-                            storageStats.recordCleanup(bytes: bytes)
-                            ratingPrompt.registerCleanup()
-                            recomputePendingRelease()
-                            storageStats.notePendingProgress(pendingReleaseBytes)
-                            WidgetCenter.shared.reloadAllTimelines()
-                            // The library change observer fires ReloadPhotos, which
-                            // refreshes the current source so deleted assets drop out.
-                        }
-                    }
+                    fireCleanupDelete(result: result, ids: ids, bytes: bytes)
                 }
             }
         }
+    }
+
+    /// (Re-)present the system delete confirmation, retrying if iOS silently drops
+    /// it. The confirmation gets dropped when fired into a flaky presentation state
+    /// — a long swipe session, or a scene iOS 26 has parked at `.foregroundInactive`
+    /// while plainly in the foreground. When that happens the performChanges
+    /// completion never returns and the dialog never appears, so the user taps
+    /// "一键清理" and nothing happens (the "刷了900张弹不出删除框" report). Re-firing
+    /// presents it again; deleting already-removed assets is a no-op, so it's safe.
+    private func fireCleanupDelete(result: PHFetchResult<PHAsset>, ids: [String], bytes: Int64, attempt: Int = 1) {
+        cleanLog("[Today] ▶︎ fire attempt \(attempt)/\(Self.cleanupMaxFireAttempts) — performChanges (delete dialog should appear NOW). \(ForegroundGate.activationStateDescription)")
+
+        let fireState = CleanupFireState()
+
+        #if DEBUG
+        // Repro aid (Settings ▸ DEBUG ▸ 模拟删除框被丢弃): on the first fire, skip the
+        // real performChanges so NO dialog appears and the scene stays active —
+        // mimicking a genuinely dropped confirmation so the active→retry path can be
+        // exercised with a handful of photos instead of a 900-swipe session.
+        if attempt == 1 && UserDefaults.standard.bool(forKey: "debug_simulate_delete_drop") {
+            cleanLog("[Today] 🧪 DEBUG simulate-drop ON — not calling performChanges on attempt 1; scene stays active so the timeout should retry")
+            scheduleCleanupFireTimeout(result: result, ids: ids, bytes: bytes, attempt: attempt, fireState: fireState)
+            return
+        }
+        #endif
+
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetChangeRequest.deleteAssets(result)
+        }) { success, error in
+            fireState.completed = true
+            // A completion means the system confirmation was shown AND resolved
+            // (confirmed / cancelled / failed) — never a silently-dropped dialog,
+            // which produces NO completion and is handled by the timeout below.
+            // PHPhotosError.userCancelled (PHPhotosErrorDomain code 3072) is the
+            // user tapping "Cancel".
+            let cancelled = (error as? PHPhotosError)?.code == .userCancelled
+            cleanLog("[Today] ◀︎ performChanges COMPLETION (attempt \(attempt)) success=\(success) cancelled=\(cancelled) error=\(error?.localizedDescription ?? "nil")")
+            DispatchQueue.main.async {
+                isCleanupDeleting = false
+                guard success else {
+                    // Cancel or a genuine failure: stop here. Never re-fire — the
+                    // user either declined (re-popping a just-cancelled dialog is
+                    // hostile) or a retry of a real error won't help. They can tap
+                    // 一键清理 again. Retry is driven ONLY by a missing completion.
+                    cleanLog(cancelled
+                        ? "[Today] user cancelled the delete dialog — done"
+                        : "[Today] delete failed (non-cancel) — done, not retrying")
+                    return
+                }
+                // A late success from an earlier attempt (whose dialog turned out to
+                // be up after all) must not double-count — finalize exactly once.
+                guard !cleanupFinalized else {
+                    cleanLog("[Today] duplicate success ignored (already finalized)")
+                    return
+                }
+                cleanupFinalized = true
+                finishCleanupDelete(ids: ids, bytes: bytes)
+            }
+        }
+
+        scheduleCleanupFireTimeout(result: result, ids: ids, bytes: bytes, attempt: attempt, fireState: fireState)
+    }
+
+    /// After a fire, decide whether the confirmation was dropped (→ retry) or is
+    /// simply still on screen waiting for the user (→ wait, never re-fire).
+    ///
+    /// Verified on-device: presenting the system delete confirmation deactivates
+    /// the scene, so once the dialog is up the scene reads `.foregroundInactive`.
+    /// Therefore `scene != active` reliably means "the dialog is showing" — firing
+    /// again would stack a duplicate confirmation (we saw two success=true
+    /// completions when we used to retry blindly). Only a STILL-ACTIVE scene means
+    /// the confirmation never appeared, i.e. it was genuinely dropped and a re-fire
+    /// is warranted. The 25s HARD watchdog unsticks the button if the user walks
+    /// away from a dialog that's up.
+    private func scheduleCleanupFireTimeout(result: PHFetchResult<PHAsset>, ids: [String], bytes: Int64, attempt: Int, fireState: CleanupFireState) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.cleanupFireTimeout) {
+            guard !fireState.completed, isCleanupDeleting else { return }
+            if ForegroundGate.foregroundSceneIsActive {
+                cleanLog("[Today] ⏱ no completion after \(Self.cleanupFireTimeout)s, scene ACTIVE → dialog was dropped, retrying. (attempt \(attempt))")
+                scheduleCleanupFireRetry(result: result, ids: ids, bytes: bytes, attempt: attempt)
+            } else {
+                cleanLog("[Today] ⏱ no completion after \(Self.cleanupFireTimeout)s, but \(ForegroundGate.activationStateDescription) → dialog is up, waiting (no retry).")
+            }
+        }
+    }
+
+    private func scheduleCleanupFireRetry(result: PHFetchResult<PHAsset>, ids: [String], bytes: Int64, attempt: Int) {
+        guard attempt < Self.cleanupMaxFireAttempts else {
+            cleanLog("[Today] ✋ exhausted \(Self.cleanupMaxFireAttempts) fire attempts — giving up; HARD watchdog will unstick the button")
+            return
+        }
+        // Wait out any in-flight presentation transition before the next attempt so
+        // we don't fire into a settling chain again.
+        ForegroundGate.runWhenReady {
+            guard isCleanupDeleting, !cleanupFinalized else { return }
+            fireCleanupDelete(result: result, ids: ids, bytes: bytes, attempt: attempt + 1)
+        }
+    }
+
+    /// Shared success path: drop the deleted assets' tags/caches and refresh stats.
+    /// The library change observer fires ReloadPhotos, which refreshes the current
+    /// source so deleted assets drop out.
+    private func finishCleanupDelete(ids: [String], bytes: Int64) {
+        let idSet = Set(ids)
+        for tag in allTags where idSet.contains(tag.assetID) {
+            modelContext.delete(tag)
+        }
+        try? modelContext.save()
+
+        for id in idSet { tagCache.removeValue(forKey: id) }
+        // Physically deleted assets can no longer be undone — drop them so undo
+        // can't write tags for dead assets.
+        undoStack.removeAll { idSet.contains($0) }
+        redCount = 0   // every delete-marked asset was just removed
+
+        storageStats.recordCleanup(bytes: bytes)
+        ratingPrompt.registerCleanup()
+        recomputePendingRelease()
+        storageStats.notePendingProgress(pendingReleaseBytes)
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     // MARK: - Bootstrap / Today source
@@ -1275,9 +1429,18 @@ struct ContentView: View {
                 // A late delivery must not resurrect an asset already swiped away.
                 guard !self.sessionProcessed.contains(id) else { return }
                 let isFirstDelivery = (self.loadingIDs.remove(id) != nil)
-                // A late full-res delivery must not overwrite a card the user has
-                // already swiped to during the degraded→full window.
-                if let current = self.activeCard, current.asset.localIdentifier != id { return }
+                // A buffered card may have promoted itself to activeCard while this
+                // first (full-res) card was still downloading on a slow iCloud link.
+                // Don't clobber it — slot this one into the buffer in order instead
+                // of dropping it, so the highest-priority asset isn't silently lost.
+                if let current = self.activeCard, current.asset.localIdentifier != id {
+                    if let idx = self.buffer.firstIndex(where: { $0.asset.localIdentifier == id }) {
+                        self.buffer[idx] = card   // upgrade in place
+                    } else if isFirstDelivery, self.isUnmarkedTodayAsset(firstAsset) {
+                        self.insertBufferInTodayOrder(card)
+                    }
+                    return
+                }
                 self.activeCard = card
                 guard isFirstDelivery else { return }   // run one-time setup once
                 // Media prep (video/Live Photo) is driven by onChange(of: activeCard.id).
@@ -1286,6 +1449,12 @@ struct ContentView: View {
                 self.ensureBuffer()
             }
         }
+
+        // Fill the rest of the buffer in parallel instead of waiting for the first
+        // (full-res) card to deliver. If iCloud stalls the first card, a buffered
+        // opportunistic card can promote itself to activeCard so the stack never
+        // hangs on a spinner. ensureBuffer skips `id` (already in loadingIDs).
+        ensureBuffer()
     }
 
     private var selectedSourceInterval: DateInterval {
@@ -1319,7 +1488,105 @@ struct ContentView: View {
     }
 
     private func rebuildCurrentSource(completion: (() -> Void)? = nil) {
+        // Review mode reuses the date source verbatim — it just rolls days that
+        // hold bucket photos and swaps the deck's eligibility filter. So the build
+        // path (and its performance) is identical to random/today.
         rebuildSource(for: selectedSourceInterval, completion: completion)
+    }
+
+    /// Begin a second pass over a tagged bucket. Reuses the random-day machinery:
+    /// pick a day that still holds photos from this bucket, then build that day's
+    /// date source — the deck filter (`isUnmarkedTodayAsset`) keeps only the
+    /// bucket's photos.
+    private func enterReviewMode(status: String) {
+        reviewStatus = status
+        reviewExhausted = false
+        // Start the pass clean so every photo in the bucket is offered again.
+        sessionProcessed.removeAll()
+        undoStack.removeAll()
+        rollReviewDay()
+    }
+
+    /// Roll another random day that still has photos in the current review bucket.
+    /// Mirrors `randomButtonTapped` but sources days from the bucket instead of the
+    /// library's unmarked photos. Sets `reviewExhausted` when the bucket is empty.
+    private func rollReviewDay() {
+        guard let status = reviewStatus else { return }
+        randomPickToken += 1
+        let token = randomPickToken
+        isPickingRandomDay = true
+
+        pickRandomReviewDay(status: status) { day in
+            guard token == self.randomPickToken else { return }
+            self.isPickingRandomDay = false
+
+            guard let day else {
+                // No day left holds a bucket photo → this pile is fully re-sorted.
+                self.reviewExhausted = true
+                self.recomputeReviewCounts()        // chips show fresh pile sizes
+                self.bootstrapBuffer(force: true)   // clears the deck → empty state
+                return
+            }
+
+            self.reviewExhausted = false
+            self.randomPickedDay = day
+            let interval = self.interval(for: .day, referenceDate: day, calendar: Calendar.current)
+            self.rebuildSource(for: interval) {
+                guard token == self.randomPickToken else { return }
+                self.bootstrapBuffer(force: true)
+            }
+        }
+    }
+
+    /// Pick a random day (start-of-day) that still has at least one photo tagged
+    /// `status` and not yet handled this session. Returns nil when the bucket is
+    /// exhausted. The bucket is typically far smaller than the library, so fetching
+    /// its assets to read creation dates is cheap.
+    private func pickRandomReviewDay(status: String, completion: @escaping (Date?) -> Void) {
+        // Snapshot on main: tagCache / sessionProcessed are main-only state.
+        let ids = tagCache.compactMap { (key, tag) in
+            (tag.status == status && !sessionProcessed.contains(key)) ? key : nil
+        }
+        guard !ids.isEmpty else { completion(nil); return }
+        let tzOffset = TimeInterval(TimeZone.current.secondsFromGMT(for: Date()))
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let results = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+            // One representative real date per day bucket (integer day index keeps
+            // this off the per-asset Calendar.startOfDay hot path).
+            var representativeDate: [Int: Date] = [:]
+            results.enumerateObjects { asset, _, _ in
+                guard let d = asset.creationDate else { return }
+                let key = Int((d.timeIntervalSince1970 + tzOffset) / 86400)
+                if representativeDate[key] == nil { representativeDate[key] = d }
+            }
+            let pick = representativeDate.values.randomElement()
+            DispatchQueue.main.async {
+                completion(pick.map { Calendar.current.startOfDay(for: $0) })
+            }
+        }
+    }
+
+    /// Leave second-pass review and roll a fresh random day.
+    private func exitReviewMode() {
+        reviewStatus = nil
+        reviewExhausted = false
+        randomButtonTapped()
+    }
+
+    /// Walk tagCache once to refresh the bucket sizes shown on the re-review entry.
+    /// Called when the empty state appears, not per body frame.
+    private func recomputeReviewCounts() {
+        var keep = 0, maybe = 0, delete = 0
+        for tag in tagCache.values {
+            switch tag.status {
+            case "keep":   keep += 1
+            case "maybe":  maybe += 1
+            case "delete": delete += 1
+            default:       break
+            }
+        }
+        reviewCounts = (keep, maybe, delete)
     }
 
     private func refreshCurrentSourcePreservingSelection(showBanner: Bool = false) {
@@ -1474,7 +1741,10 @@ struct ContentView: View {
             let all = PHAsset.fetchAssets(with: allOpt)
 
             guard all.count > 0 else {
-                DispatchQueue.main.async { completion(todayStart) }
+                DispatchQueue.main.async {
+                    self.randomExhausted = true
+                    completion(todayStart)
+                }
                 return
             }
 
@@ -1504,14 +1774,21 @@ struct ContentView: View {
                 finalDay = calendar.startOfDay(for: bounds.newest)
             }
 
+            // No day still holds an unmarked photo → random has nothing left, so
+            // the empty state should pivot to a second pass over the tagged piles.
+            let exhausted = pendingDays.isEmpty
+
             DispatchQueue.main.async {
+                self.randomExhausted = exhausted
+                if exhausted { self.recomputeReviewCounts() }   // chips show fresh sizes
                 completion(finalDay)
             }
         }
     }
 
     private func switchToToday() {
-        guard dateSourceMode != .today else { return }
+        guard dateSourceMode != .today || reviewStatus != nil else { return }
+        reviewStatus = nil
         randomPickToken += 1
         isPickingRandomDay = false
         dateSourceMode = .today
@@ -1528,7 +1805,9 @@ struct ContentView: View {
         // override the source the user just switched to.
         randomPickToken += 1
         isPickingRandomDay = false
-        let modeChanged = dateSourceMode != .today
+        let leavingReview = reviewStatus != nil
+        reviewStatus = nil
+        let modeChanged = (dateSourceMode != .today) || leavingReview
         if modeChanged {
             dateSourceMode = .today
             randomPickedDay = nil
@@ -1560,6 +1839,7 @@ struct ContentView: View {
     /// Jump to a specific historical month. Always rebuilds, even if the month
     /// scope is already active, because the reference month changed.
     private func selectMonth(_ month: Date) {
+        reviewStatus = nil
         randomPickToken += 1
         isPickingRandomDay = false
         monthReference = month
@@ -1575,6 +1855,7 @@ struct ContentView: View {
 
     private func randomButtonTapped() {
         guard !isPickingRandomDay else { return }
+        reviewStatus = nil
         randomPickToken += 1
         let token = randomPickToken
         // Set immediately (both paths) so a rapid second tap is ignored by the
@@ -1722,46 +2003,165 @@ struct ContentView: View {
         Self.monthDisplayFormatter.string(from: date)
     }
 
-    private var randomContinueEmptyState: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "shuffle")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundColor(.blue)
+    /// Resolved copy + behavior for the random/review empty state. Computed in plain
+    /// code (not a ViewBuilder) so the view body stays trivial for the type-checker.
+    private struct EmptyStateModel {
+        var pilesDone: Bool
+        var showRoll: Bool
+        var titleKey: String
+        var descKey: String
+        var rollLabel: String
+        var rollIcon: String
+    }
 
-            Text("random.empty.title".localized)
+    // Empty-state variants:
+    //  • review, bucket has more days  → "this day's done", roll another bucket day.
+    //  • review, bucket exhausted      → this pile is fully re-sorted; offer the
+    //    other piles + back to random.
+    //  • random exhausted (library has no unmarked photos) → pivot to the piles.
+    //  • random, just this day empty   → roll another random day.
+    private var emptyStateModel: EmptyStateModel {
+        let inReview = reviewStatus != nil
+        let pilesDone = inReview ? reviewExhausted : randomExhausted
+        // A primary re-roll button shows unless we've pivoted to the piles in random
+        // mode (there it would just loop over already-sorted days).
+        let showRoll = inReview || !pilesDone
+
+        let titleKey: String
+        let descKey: String
+        if inReview {
+            titleKey = pilesDone ? "review.done.title" : "random.empty.title"
+            descKey  = pilesDone ? "review.done.description" : "random.empty.description"
+        } else {
+            titleKey = pilesDone ? "review.exhausted.title" : "random.empty.title"
+            descKey  = pilesDone ? "review.exhausted.description" : "random.empty.description"
+        }
+        let backToRandom = inReview && pilesDone
+        return EmptyStateModel(
+            pilesDone: pilesDone,
+            showRoll: showRoll,
+            titleKey: titleKey,
+            descKey: descKey,
+            rollLabel: backToRandom ? "review.backToRandom" : "random.empty.cta",
+            rollIcon: backToRandom ? "shuffle" : "sparkles"
+        )
+    }
+
+    /// Primary action of the empty-state roll button: next bucket day while a review
+    /// pile has days left, back to random once it's exhausted, else another random day.
+    private func emptyStateRoll() {
+        let inReview = reviewStatus != nil
+        let pilesDone = inReview ? reviewExhausted : randomExhausted
+        if inReview && !pilesDone {
+            rollReviewDay()
+        } else if inReview {
+            exitReviewMode()
+        } else {
+            randomButtonTapped()
+        }
+    }
+
+    private var randomContinueEmptyState: some View {
+        let model = emptyStateModel
+        return VStack(spacing: 14) {
+            Image(systemName: model.pilesDone ? "checkmark.circle.fill" : "shuffle")
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundColor(model.pilesDone ? .green : .blue)
+
+            Text(model.titleKey.localized)
                 .font(.headline)
 
-            Text("random.empty.description".localized)
+            Text(model.descKey.localized)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
 
-            Button(action: randomButtonTapped) {
-                HStack(spacing: 8) {
-                    if isPickingRandomDay {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Image(systemName: "sparkles")
+            if model.showRoll {
+                Button(action: emptyStateRoll) {
+                    HStack(spacing: 8) {
+                        if isPickingRandomDay {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: model.rollIcon)
+                        }
+                        Text(model.rollLabel.localized)
+                            .font(.headline)
                     }
-                    Text("random.empty.cta".localized)
-                        .font(.headline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(Color.blue)
+                    .clipShape(Capsule())
                 }
-                .foregroundColor(.white)
-                .padding(.horizontal, 18)
-                .padding(.vertical, 12)
-                .background(Color.blue)
-                .clipShape(Capsule())
+                .buttonStyle(.plain)
+                .disabled(isPickingRandomDay)
             }
-            .buttonStyle(.plain)
-            .disabled(isPickingRandomDay)
+
+            if model.pilesDone { reviewBucketSection }
         }
         .padding(.horizontal, 24)
+    }
+
+    /// Secondary "take another pass" entry: chips for every non-empty tagged bucket
+    /// (Keep / Maybe / To-Delete) that reload the deck for re-sorting. All three are
+    /// always shown — including the one just finished, since photos left as-is keep
+    /// its count up and it can be re-run for an endless loop.
+    @ViewBuilder
+    private var reviewBucketSection: some View {
+        let buckets: [(status: String, titleKey: String, icon: String, color: Color, count: Int)] = [
+            ("keep",   "library.favorites", "heart.fill",            .green,  reviewCounts.keep),
+            ("maybe",  "library.maybe",     "questionmark.circle.fill", .yellow, reviewCounts.maybe),
+            ("delete", "library.toDelete",  "trash.fill",            .red,    reviewCounts.delete),
+        ].filter { $0.count > 0 }
+
+        if !buckets.isEmpty {
+            VStack(spacing: 8) {
+                Text("review.entry.heading".localized)
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
+                    .padding(.top, 6)
+
+                ForEach(buckets, id: \.status) { bucket in
+                    Button {
+                        enterReviewMode(status: bucket.status)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: bucket.icon)
+                                .foregroundColor(bucket.color)
+                                .frame(width: 22)
+                            Text(bucket.titleKey.localized)
+                                .font(.subheadline.weight(.medium))
+                                .foregroundColor(.primary)
+                            Spacer(minLength: 8)
+                            Text("\(bucket.count)")
+                                .font(.subheadline.monospacedDigit())
+                                .foregroundColor(.secondary)
+                            Image(systemName: "chevron.right")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Color.secondary.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .frame(maxWidth: 320)
+        }
     }
 
     private func isUnmarkedTodayAsset(_ asset: PHAsset) -> Bool {
         let id = asset.localIdentifier
         if sessionProcessed.contains(id) { return false }
+        // Second-pass review: an asset is "actionable" while it still carries the
+        // bucket's status. Re-tagging it (even back to the same status) marks it
+        // sessionProcessed above, so it drops out of the deck after one swipe.
+        if let rs = reviewStatus {
+            return tagCache[id]?.status == rs
+        }
         if let t = tagCache[id], t.status != "pending" { return false }
         return true
     }
@@ -1944,6 +2344,9 @@ struct ContentView: View {
 
     // MARK: - Widget count
     private func recalcTodayPendingCountFast() {
+        // The widget tracks unmarked "today" photos. A second-pass review deck is
+        // made of already-tagged assets, so don't let it overwrite that count.
+        guard reviewStatus == nil else { return }
         todayPendingCount = todayAssets.reduce(0) { acc, a in
             let id = a.localIdentifier
             if sessionProcessed.contains(id) { return acc }
@@ -2791,8 +3194,11 @@ struct ContentView: View {
                     return
                 }
 
-                self.todayPendingCount += 1
-                self.writeWidgetCountDebounced(self.todayPendingCount)
+                // A second-pass deck isn't part of the "today pending" widget count.
+                if self.reviewStatus == nil {
+                    self.todayPendingCount += 1
+                    self.writeWidgetCountDebounced(self.todayPendingCount)
+                }
 
                 self.sourceRevision += 1
                 let revision = self.sourceRevision
