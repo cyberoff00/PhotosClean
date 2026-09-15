@@ -8,6 +8,11 @@
 	<string></string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>We need access to your photo library to help you organize and delete photos.</string>
+	<!-- The app has its own "Manage Selected Photos" entry (LibraryView), so the
+	     system's per-launch "Select More Photos?" prompt for limited access is
+	     redundant nagging. -->
+	<key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
+	<true/>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array/>
 	<key>UIBackgroundModes</key>

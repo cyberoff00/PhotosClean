@@ -87,8 +87,12 @@ struct AICleanResultsView: View {
     /// The in-flight scan, kept so onDisappear can cancel it.
     @State private var loadTask: Task<Void, Never>? = nil
 
-    private let blurCIContext = CIContext(options: nil)
-    private let blurRenderColorSpace = CGColorSpaceCreateDeviceRGB()
+    // static: shared app-lifetime context (CIContext is thread-safe and
+    // expensive to create per view instance).
+    private static let sharedBlurCIContext = CIContext(options: nil)
+    private static let sharedBlurRenderColorSpace = CGColorSpaceCreateDeviceRGB()
+    private var blurCIContext: CIContext { Self.sharedBlurCIContext }
+    private var blurRenderColorSpace: CGColorSpace { Self.sharedBlurRenderColorSpace }
 
     var body: some View {
         Group {

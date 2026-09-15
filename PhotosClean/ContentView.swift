@@ -77,6 +77,9 @@ struct ContentView: View {
     /// A single empty *day* (the common case) leaves this false: rolling another
     /// day still works.
     @State private var randomExhausted: Bool = false
+    /// Photos access denied/restricted. Without this the empty deck reads as
+    /// "all caught up", which is a lie when we simply can't see the library.
+    @State private var photoAccessDenied: Bool = false
     /// True once the current review bucket has no day left to roll — every photo in
     /// it has been re-sorted this pass. Pivots the empty state to the other piles.
     @State private var reviewExhausted: Bool = false
@@ -107,6 +110,12 @@ struct ContentView: View {
 
     // MARK: Tag cache (关键：O(1) lookup)
     @State private var tagCache: [String: PhotoTag] = [:]
+    // Detached scratch edits accumulated between saves — see upsertTag /
+    // commitPendingTags in RetroCleanView for why writes are batched off the
+    // swipe path (every save re-fires every live @Query — LibraryView and any
+    // grid on the stack — right inside the swipe animation's completion).
+    @State private var pendingTags: [String: PhotoTag] = [:]
+    @State private var pendingTagSave: DispatchWorkItem?
 
     // MARK: Header counts cache（避免 body 里每帧 filter allTags）
     @State private var redCount: Int = 0
@@ -385,12 +394,24 @@ struct ContentView: View {
 
                 // Fixed-height stage: only the media changes, the surrounding layout stays put.
                 ZStack {
+                    if photoAccessDenied {
+                        ContentUnavailableView {
+                            Label("grid.photoAccess.deniedTitle".localized, systemImage: "lock.shield")
+                        } description: {
+                            Text("grid.photoAccess.deniedMessage".localized)
+                        } actions: {
+                            Button("grid.photoAuth.openSettings".localized) {
+                                PhotoLibraryAuth.openSettings()
+                            }
+                        }
+                    }
+
                     ContentUnavailableView(
                         "empty.title".localized,
                         systemImage: "sparkles",
                         description: Text("empty.description".localized)
                     )
-                    .opacity(shouldShowStageEmptyState && !shouldShowRandomContinueState ? 1 : 0)
+                    .opacity(shouldShowStageEmptyState && !shouldShowRandomContinueState && !photoAccessDenied ? 1 : 0)
 
                     stageLoadingView
                         .opacity(shouldShowStageLoadingState ? 1 : 0)
@@ -405,8 +426,8 @@ struct ContentView: View {
                     // animation transaction — that capture is what made the page
                     // occasionally flash when a batch was swiped to the end.
                     randomContinueEmptyState
-                        .opacity(shouldShowRandomContinueState ? 1 : 0)
-                        .allowsHitTesting(shouldShowRandomContinueState)
+                        .opacity(shouldShowRandomContinueState && !photoAccessDenied ? 1 : 0)
+                        .allowsHitTesting(shouldShowRandomContinueState && !photoAccessDenied)
                         .animation(.none, value: shouldShowRandomContinueState)
 
                     // Inline quota upgrade card (hard wall for free users)
@@ -467,6 +488,7 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            refreshPhotoAuthStatus()
             buildTagCacheOnce()
             recomputePendingRelease()
             if !hasLoadedOnce {
@@ -496,7 +518,7 @@ struct ContentView: View {
                 ensureBuffer()
                 refreshFilmstripSnapshot()
             }
-            storageStats.notePendingProgress(pendingReleaseBytes)
+            storageStats.refreshWidgetSnapshot()
             // Warm the next random day in the background so re-rolling stays
             // fast and sharp.
             prewarmNextRandomDay()
@@ -517,9 +539,11 @@ struct ContentView: View {
         // When the app resigns active / goes to background, release audio focus so other apps can resume.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             stopAllMedia()
+            flushPendingTagSave()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             stopAllMedia()
+            flushPendingTagSave()
         }
         // Midnight rollover: lift the free-quota wall and refresh "today"-anchored sources.
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name.NSCalendarDayChanged).receive(on: RunLoop.main)) { _ in
@@ -528,6 +552,7 @@ struct ContentView: View {
         // Returning to the foreground may also cross midnight — re-check the quota.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             _ = paywallGate.checkQuota(isPremium: storeManager.hasUnlockedPremium)
+            refreshPhotoAuthStatus()
         }
         .onChange(of: activeCard?.asset.localIdentifier) { _, _ in
             stopAllMedia()
@@ -538,7 +563,6 @@ struct ContentView: View {
         }
         .onChange(of: redCount) { _, _ in
             recomputePendingRelease()
-            storageStats.notePendingProgress(pendingReleaseBytes)
         }
         // Refresh the re-review bucket sizes only when the empty state surfaces,
         // so the chips never iterate tagCache on a hot body frame.
@@ -557,6 +581,8 @@ struct ContentView: View {
             stopAllMedia()
             cancelPendingImageRequests()
             cancelLiveWarmRequests()
+            // Switching tabs: commit batched tag edits so the Library tab sees them.
+            flushPendingTagSave()
         }
         .alert("cleanup.auth.title".localized, isPresented: $showCleanupAuthAlert) {
             Button("cleanup.auth.settings".localized) { PhotoLibraryAuth.openSettings() }
@@ -790,6 +816,7 @@ struct ContentView: View {
             if !paywallGate.showPaywall { paywallGate.showPaywall = true }
             return
         }
+        SwipeFeedback.shared.swipe(status: status)
         isAnimatingOut = true
         settleOffset = t
 
@@ -825,13 +852,15 @@ struct ContentView: View {
                 self.imageManager.cancelImageRequest(reqID)
             }
 
+            // Size estimate must be cached before the tag transition so the
+            // daily cumulative progress adds a non-zero amount.
+            if status == "delete" {
+                self.storageStats.noteAsset(card.asset)
+            }
+
             self.upsertTag(assetID: assetID) { tag in
                 tag.status = status
                 tag.createdAt = Date()
-            }
-
-            if status == "delete" {
-                self.storageStats.noteAsset(card.asset)
             }
 
             // Quota was recorded at commit entry. Hard wall: the moment a free
@@ -1113,7 +1142,8 @@ struct ContentView: View {
     private func recomputePendingRelease() {
         var total: Int64 = 0
         var allPrecise = true
-        for (id, tag) in tagCache where tag.status == "delete" {
+        forEachEffectiveTag { id, tag in
+            guard tag.status == "delete" else { return }
             total += storageStats.bestSize(forID: id)
             if !storageStats.hasPrecise(forID: id) { allPrecise = false }
         }
@@ -1125,7 +1155,9 @@ struct ContentView: View {
         }
     }
 
-    /// Single status badge: shows pending-to-release size, optionally with goal.
+    /// Single status badge: goal progress is today's cumulative marked total
+    /// (survives actual deletion); the goal-off fallback shows the current
+    /// trash size.
     @ViewBuilder
     private var stageStatusBadge: some View {
         let bytes = pendingReleaseBytes
@@ -1137,7 +1169,7 @@ struct ContentView: View {
             HStack(spacing: 4) {
                 Image(systemName: achieved ? "checkmark.circle.fill" : "target")
                     .font(.system(size: 10, weight: .semibold))
-                Text("\(prefix)\(bytes.byteCountShort) / \(StorageStats.goalLabel(storageStats.dailyGoalBytes))")
+                Text("\(storageStats.dailyMarkedBytes.byteCountShort) / \(StorageStats.goalLabel(storageStats.dailyGoalBytes))")
                     .font(.caption2.weight(.semibold).monospacedDigit())
             }
             .foregroundColor(color)
@@ -1182,13 +1214,23 @@ struct ContentView: View {
     /// Collect every asset whose freshest tag is "delete" and remove it from the
     /// photo library. iOS shows its own deletion confirmation before anything is
     /// actually deleted, so this is safe as a single tap.
+    /// Re-checked on appear and on returning to foreground. If access flips
+    /// from denied to granted iOS relaunches the app, so recovering here is
+    /// only about showing the right empty state, not about reloading.
+    private func refreshPhotoAuthStatus() {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        photoAccessDenied = (status == .denied || status == .restricted)
+    }
+
     private func cleanupMarkedForDeletion() {
-        var latest: [String: (status: String, date: Date)] = [:]
-        for tag in allTags {
-            if let e = latest[tag.assetID], tag.createdAt <= e.date { continue }
-            latest[tag.assetID] = (tag.status, tag.createdAt)
+        // Commit batched swipe edits first so the DB matches what we're about to
+        // delete, then read the (now authoritative) in-memory cache: allTags is a
+        // @Query and may not reflect a just-saved insert until the next body pass.
+        flushPendingTagSave()
+        var ids: [String] = []
+        forEachEffectiveTag { id, tag in
+            if tag.status == "delete" { ids.append(id) }
         }
-        let ids = latest.compactMap { $0.value.status == "delete" ? $0.key : nil }
         cleanLog("[Today] tapped cleanup — ids=\(ids.count) isCleanupDeleting=\(isCleanupDeleting)")
         guard !ids.isEmpty else { cleanLog("[Today] abort: no ids"); return }
         // Re-entrancy guard: one delete request at a time. Without this, repeated
@@ -1296,7 +1338,6 @@ struct ContentView: View {
         PHPhotoLibrary.shared().performChanges({
             PHAssetChangeRequest.deleteAssets(result)
         }) { success, error in
-            fireState.completed = true
             // A completion means the system confirmation was shown AND resolved
             // (confirmed / cancelled / failed) — never a silently-dropped dialog,
             // which produces NO completion and is handled by the timeout below.
@@ -1305,6 +1346,10 @@ struct ContentView: View {
             let cancelled = (error as? PHPhotosError)?.code == .userCancelled
             cleanLog("[Today] ◀︎ performChanges COMPLETION (attempt \(attempt)) success=\(success) cancelled=\(cancelled) error=\(error?.localizedDescription ?? "nil")")
             DispatchQueue.main.async {
+                // Set on main: the watchdog reads this on main, and this callback
+                // arrives on an arbitrary background queue — writing it up there
+                // was an unsynchronized cross-thread race.
+                fireState.completed = true
                 isCleanupDeleting = false
                 guard success else {
                     // Cancel or a genuine failure: stop here. Never re-fire — the
@@ -1376,7 +1421,10 @@ struct ContentView: View {
         }
         try? modelContext.save()
 
-        for id in idSet { tagCache.removeValue(forKey: id) }
+        for id in idSet {
+            tagCache.removeValue(forKey: id)
+            pendingTags.removeValue(forKey: id)
+        }
         // Physically deleted assets can no longer be undone — drop them so undo
         // can't write tags for dead assets.
         undoStack.removeAll { idSet.contains($0) }
@@ -1385,7 +1433,9 @@ struct ContentView: View {
         storageStats.recordCleanup(bytes: bytes)
         ratingPrompt.registerCleanup()
         recomputePendingRelease()
-        storageStats.notePendingProgress(pendingReleaseBytes)
+        // Cumulative daily progress is untouched by the physical deletion;
+        // just re-publish the snapshot so the widget stays fresh.
+        storageStats.refreshWidgetSnapshot()
         WidgetCenter.shared.reloadAllTimelines()
     }
 
@@ -1544,8 +1594,9 @@ struct ContentView: View {
     /// its assets to read creation dates is cheap.
     private func pickRandomReviewDay(status: String, completion: @escaping (Date?) -> Void) {
         // Snapshot on main: tagCache / sessionProcessed are main-only state.
-        let ids = tagCache.compactMap { (key, tag) in
-            (tag.status == status && !sessionProcessed.contains(key)) ? key : nil
+        var ids: [String] = []
+        forEachEffectiveTag { id, tag in
+            if tag.status == status && !sessionProcessed.contains(id) { ids.append(id) }
         }
         guard !ids.isEmpty else { completion(nil); return }
         let tzOffset = TimeInterval(TimeZone.current.secondsFromGMT(for: Date()))
@@ -1578,7 +1629,7 @@ struct ContentView: View {
     /// Called when the empty state appears, not per body frame.
     private func recomputeReviewCounts() {
         var keep = 0, maybe = 0, delete = 0
-        for tag in tagCache.values {
+        forEachEffectiveTag { _, tag in
             switch tag.status {
             case "keep":   keep += 1
             case "maybe":  maybe += 1
@@ -1590,6 +1641,16 @@ struct ContentView: View {
     }
 
     private func refreshCurrentSourcePreservingSelection(showBanner: Bool = false) {
+        // First-launch auth race: the initial auto-roll ran before Photos
+        // access was granted, so no day was picked. Granting access fires a
+        // library change that lands here — do the real roll now instead of
+        // rebuilding the unpicked (today-fallback) source.
+        if dateSourceMode == .random, randomPickedDay == nil, reviewStatus == nil,
+           PHPhotoLibrary.authorizationStatus(for: .readWrite) != .notDetermined {
+            randomButtonTapped()
+            return
+        }
+
         let currentID = activeCard?.asset.localIdentifier
 
         rebuildCurrentSource {
@@ -1681,13 +1742,20 @@ struct ContentView: View {
     }
 
     private func fetchLibraryDateBounds() -> (oldest: Date, newest: Date)? {
+        // Assets with no creationDate sort to an end of the results; without
+        // this predicate a single such asset lands in firstObject, the date
+        // guard fails, and callers see "no bounds" for a perfectly full library.
+        let datedPredicate = NSPredicate(format: "creationDate != nil")
+
         let oldestOpt = PHFetchOptions()
+        oldestOpt.predicate = datedPredicate
         oldestOpt.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         oldestOpt.fetchLimit = 1
         let oldestRes = PHAsset.fetchAssets(with: oldestOpt)
         guard let oldestAsset = oldestRes.firstObject, let oldestDate = oldestAsset.creationDate else { return nil }
 
         let newestOpt = PHFetchOptions()
+        newestOpt.predicate = datedPredicate
         newestOpt.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         newestOpt.fetchLimit = 1
         let newestRes = PHAsset.fetchAssets(with: newestOpt)
@@ -1696,7 +1764,19 @@ struct ContentView: View {
         return (oldest: oldestDate, newest: newestDate)
     }
 
-    private func pickRandomDayWithPhotos(completion: @escaping (Date) -> Void) {
+    /// Completes with nil when no day could be picked (Photos access not yet
+    /// determined, or the fetch came back empty). Callers must treat nil as
+    /// "don't touch the current selection" — the old today-fallback poisoned
+    /// `randomPickedDay` during the first-launch auth race, which is exactly
+    /// how "random day" got stuck on today for fresh installs.
+    private func pickRandomDayWithPhotos(completion: @escaping (Date?) -> Void) {
+        // First launch: the auto-roll fires before the (deliberately delayed)
+        // permission dialog. Fetching now would see zero assets — bail out and
+        // let the post-grant library-change retry do the real pick.
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) != .notDetermined else {
+            completion(nil)
+            return
+        }
         // Snapshot current pending status on main thread, then use it in background.
         let nonPendingIDs = Set(allTags.compactMap { tag in
             tag.status == "pending" ? nil : tag.assetID
@@ -1707,20 +1787,17 @@ struct ContentView: View {
 
         // 整个随机选日逻辑移到后台线程，避免阻塞 UI
         DispatchQueue.global(qos: .userInitiated).async {
-            guard let bounds = cachedBounds ?? self.fetchLibraryDateBounds() else {
-                DispatchQueue.main.async {
-                    completion(self.randomPickedDay ?? Calendar.current.startOfDay(for: Date()))
-                }
-                return
-            }
-            // Persist freshly-computed bounds back to the cache (on main).
-            if cachedBounds == nil {
+            // Bounds are only warmed here for the month picker's cache. The pick
+            // itself derives everything from the enumeration below — it used to
+            // guard on bounds, and a single nil-creationDate asset at either end
+            // of the library made that guard fail on every attempt, sending every
+            // "random day" to the today-fallback. Never gate the pick on bounds.
+            if cachedBounds == nil, let bounds = self.fetchLibraryDateBounds() {
                 DispatchQueue.main.async { self.cachedLibraryDateBounds = bounds }
             }
 
             let calendar = Calendar.current
             let todayStart = calendar.startOfDay(for: Date())
-            let hasMultipleDays = calendar.startOfDay(for: bounds.oldest) != calendar.startOfDay(for: bounds.newest)
 
             // Day bucketing via integer keys instead of Calendar.startOfDay per
             // asset. startOfDay is an ICU/Calendar call (~microseconds each); on a
@@ -1743,7 +1820,7 @@ struct ContentView: View {
             guard all.count > 0 else {
                 DispatchQueue.main.async {
                     self.randomExhausted = true
-                    completion(todayStart)
+                    completion(nil)
                 }
                 return
             }
@@ -1755,7 +1832,6 @@ struct ContentView: View {
             all.enumerateObjects { asset, _, _ in
                 guard let d = asset.creationDate else { return }
                 let key = dayKey(d)
-                if hasMultipleDays && key == todayKey { return }
 
                 anyDays.insert(key)
                 if representativeDate[key] == nil { representativeDate[key] = d }
@@ -1766,13 +1842,17 @@ struct ContentView: View {
                 pendingDays.insert(key)
             }
 
-            let pickedKey = pendingDays.randomElement() ?? anyDays.randomElement()
-            let finalDay: Date
-            if let pickedKey, let rep = representativeDate[pickedKey] {
-                finalDay = calendar.startOfDay(for: rep)
-            } else {
-                finalDay = calendar.startOfDay(for: bounds.newest)
+            // Random should surface history: only offer today when it is
+            // literally the only day the library has.
+            if anyDays.contains(where: { $0 != todayKey }) {
+                anyDays.remove(todayKey)
+                pendingDays.remove(todayKey)
             }
+
+            let pickedKey = pendingDays.randomElement() ?? anyDays.randomElement()
+            let finalDay = pickedKey
+                .flatMap { representativeDate[$0] }
+                .map { calendar.startOfDay(for: $0) }
 
             // No day still holds an unmarked photo → random has nothing left, so
             // the empty state should pivot to a second pass over the tagged piles.
@@ -1872,6 +1952,7 @@ struct ContentView: View {
             prewarmedRandomDay = nil
             prewarmedRandomAssets = []
             randomPickedDay = day
+            maybeWarnLimitedRandom(day)
             let interval = interval(for: .day, referenceDate: day, calendar: Calendar.current)
             rebuildSource(for: interval) {
                 guard token == randomPickToken else { return }
@@ -1889,7 +1970,12 @@ struct ContentView: View {
         pickRandomDayWithPhotos { day in
             guard token == randomPickToken else { return }
             isPickingRandomDay = false
+            // Nil = nothing pickable right now (auth pending / empty fetch).
+            // Leave the current selection untouched; the post-grant library
+            // change retries the roll.
+            guard let day else { return }
             randomPickedDay = day
+            maybeWarnLimitedRandom(day)
             let interval = interval(for: .day, referenceDate: day, calendar: Calendar.current)
             rebuildSource(for: interval) {
                 guard token == randomPickToken else { return }
@@ -1899,6 +1985,16 @@ struct ContentView: View {
                 prewarmNextRandomDay()
             }
         }
+    }
+
+    /// Limited Photos access whose selection only spans today makes "random
+    /// day" degenerate into today every time. Tell the user why instead of
+    /// looking broken.
+    private func maybeWarnLimitedRandom(_ day: Date) {
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited,
+              Calendar.current.isDateInToday(day) else { return }
+        bannerTextKey = "random.limited.notice"
+        showBannerFor(seconds: 4)
     }
 
     // MARK: - Random-day pre-warming
@@ -1918,11 +2014,17 @@ struct ContentView: View {
         isPrewarmingRandom = true
 
         pickRandomDayWithPhotos { day in
+            guard let day else {
+                self.isPrewarmingRandom = false
+                return
+            }
             // Snapshot marked assets on the main thread; the prewarm must skip them
             // so the first photo the user actually sees (the first *unmarked* one)
             // is the one we pre-download.
             var marked = self.sessionProcessed
-            for (id, tag) in self.tagCache where tag.status != "pending" { marked.insert(id) }
+            self.forEachEffectiveTag { id, tag in
+                if tag.status != "pending" { marked.insert(id) }
+            }
 
             DispatchQueue.global(qos: .utility).async {
                 let assets = self.fetchDayAssets(day, limit: Self.randomPrewarmCount, excluding: marked)
@@ -2160,9 +2262,9 @@ struct ContentView: View {
         // bucket's status. Re-tagging it (even back to the same status) marks it
         // sessionProcessed above, so it drops out of the deck after one swipe.
         if let rs = reviewStatus {
-            return tagCache[id]?.status == rs
+            return effectiveStatus(id) == rs
         }
-        if let t = tagCache[id], t.status != "pending" { return false }
+        if let s = effectiveStatus(id), s != "pending" { return false }
         return true
     }
 
@@ -2287,7 +2389,19 @@ struct ContentView: View {
                 }
             }
             if let img {
-                completion(CardState(asset: asset, image: img))
+                if isDegraded {
+                    completion(CardState(asset: asset, image: img))
+                } else {
+                    // Full image: force-decode off the main thread. PHImageManager
+                    // hands back an undecoded image, so the first Image(uiImage:)
+                    // render would otherwise decode the full bitmap ON THE MAIN
+                    // THREAD — the same swipe stalls Retro measured and fixed.
+                    img.prepareForDisplay { decoded in
+                        DispatchQueue.main.async {
+                            completion(CardState(asset: asset, image: decoded ?? img))
+                        }
+                    }
+                }
             } else if !isDegraded {
                 // Final delivery without an image = real failure (e.g. iCloud
                 // on bad network). Degraded interim callbacks never end up here.
@@ -2339,7 +2453,11 @@ struct ContentView: View {
             map[tag.assetID] = tag
         }
         tagCache = map
-        redCount = tagCache.values.reduce(0) { $0 + ($1.status == "delete" ? 1 : 0) }
+        var deletes = 0
+        forEachEffectiveTag { _, tag in
+            if tag.status == "delete" { deletes += 1 }
+        }
+        redCount = deletes
     }
 
     // MARK: - Widget count
@@ -2350,7 +2468,7 @@ struct ContentView: View {
         todayPendingCount = todayAssets.reduce(0) { acc, a in
             let id = a.localIdentifier
             if sessionProcessed.contains(id) { return acc }
-            if let t = tagCache[id], t.status != "pending" { return acc }
+            if let s = effectiveStatus(id), s != "pending" { return acc }
             return acc + 1
         }
         writeWidgetCountDebounced(todayPendingCount)
@@ -2364,6 +2482,9 @@ struct ContentView: View {
         widgetReloadTask?.cancel()
         widgetReloadTask = Task {
             try? await Task.sleep(nanoseconds: 400_000_000)
+            // A cancelled sleep throws immediately — without this guard every
+            // cancel fires a reload right away and the debounce does nothing.
+            guard !Task.isCancelled else { return }
             await MainActor.run {
                 WidgetCenter.shared.reloadAllTimelines()
             }
@@ -2371,23 +2492,88 @@ struct ContentView: View {
     }
 
     // MARK: - UpsertTag
+    //
+    // Tag edits are accumulated as DETACHED PhotoTag scratch objects (created
+    // but never inserted, so mutating them dirties nothing) and flushed to
+    // modelContext in ONE batch when the user pauses / leaves / backgrounds.
+    // Saving on every swipe forces every live @Query (LibraryView plus any grid
+    // on the stack) to re-fetch and re-run its body inside the swipe animation's
+    // completion — the same 250-500ms-per-swipe cascade Retro measured and fixed.
+    private func effectiveStatus(_ assetID: String) -> String? {
+        if let pending = pendingTags[assetID] { return pending.status }
+        return tagCache[assetID]?.status
+    }
+
+    private func effectiveNote(_ assetID: String) -> String? {
+        if let pending = pendingTags[assetID] { return pending.note }
+        return tagCache[assetID]?.note
+    }
+
+    /// Iterate the merged tag view: committed cache overlaid with pending edits.
+    private func forEachEffectiveTag(_ body: (String, PhotoTag) -> Void) {
+        for (id, tag) in tagCache where pendingTags[id] == nil { body(id, tag) }
+        for (id, scratch) in pendingTags { body(id, scratch) }
+    }
+
     private func upsertTag(assetID: String, update: (PhotoTag) -> Void) {
-        let tag: PhotoTag
-        if let existing = tagCache[assetID] {
-            tag = existing
+        // Seed a detached scratch with the current effective state so a
+        // status-only edit preserves the note (and vice-versa).
+        let scratch: PhotoTag
+        if let pending = pendingTags[assetID] {
+            scratch = pending
         } else {
-            tag = PhotoTag(assetID: assetID, status: "pending")
-            modelContext.insert(tag)
+            scratch = PhotoTag(assetID: assetID, status: tagCache[assetID]?.status ?? "pending")
+            scratch.note = tagCache[assetID]?.note
         }
 
-        let oldStatus = tag.status
+        let oldStatus = effectiveStatus(assetID) ?? "pending"
+        scratch.createdAt = Date()
+        update(scratch)
+        pendingTags[assetID] = scratch
+        scheduleTagSave()
 
-        update(tag)
+        if oldStatus != "delete" && scratch.status == "delete" { redCount += 1 }
+        if oldStatus == "delete" && scratch.status != "delete" { redCount = max(0, redCount - 1) }
+        storageStats.noteStatusTransition(assetID: assetID, from: oldStatus, to: scratch.status)
+    }
+
+    private func scheduleTagSave() {
+        pendingTagSave?.cancel()
+        let work = DispatchWorkItem {
+            self.pendingTagSave = nil
+            self.commitPendingTags()
+        }
+        pendingTagSave = work
+        // Long debounce: a burst of swipes keeps rescheduling this, so the
+        // context is only dirtied once the user genuinely pauses.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+    }
+
+    private func flushPendingTagSave() {
+        pendingTagSave?.cancel()
+        pendingTagSave = nil
+        commitPendingTags()
+    }
+
+    /// Apply every accumulated edit to the context in one batch and save once.
+    /// This is the only place this view dirties the shared context.
+    private func commitPendingTags() {
+        guard !pendingTags.isEmpty else { return }
+        for (id, scratch) in pendingTags {
+            let tag: PhotoTag
+            if let existing = tagCache[id] {
+                tag = existing
+            } else {
+                tag = PhotoTag(assetID: id, status: scratch.status)
+                modelContext.insert(tag)
+            }
+            tag.status = scratch.status
+            tag.note = scratch.note
+            tag.createdAt = scratch.createdAt
+            tagCache[id] = tag
+        }
+        pendingTags.removeAll()
         try? modelContext.save()
-        tagCache[assetID] = tag
-
-        if oldStatus != "delete" && tag.status == "delete" { redCount += 1 }
-        if oldStatus == "delete" && tag.status != "delete" { redCount = max(0, redCount - 1) }
     }
 
     // MARK: - Media helpers
@@ -2912,14 +3098,14 @@ struct ContentView: View {
         ZStack {
             Color.black.opacity(0.5)
                 .ignoresSafeArea()
-                .onTapGesture { showPreview = false }
+                .onTapGesture { closePreview() }
 
             VStack(spacing: 20) {
                 HStack {
                     Text("common.preview".localized)
                         .font(.system(size: 18, weight: .semibold))
                     Spacer()
-                    Button(action: { showPreview = false }) {
+                    Button(action: { closePreview() }) {
                         Image(systemName: "xmark")
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.secondary)
@@ -2936,7 +3122,7 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 12) {
-                    Button(action: { showPreview = false }) {
+                    Button(action: { closePreview() }) {
                         Text("common.cancel".localized)
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.primary)
@@ -2947,7 +3133,7 @@ struct ContentView: View {
                     }
 
                     Button(action: {
-                        showPreview = false
+                        closePreview()
                         presentShareSheet(items: [image])
                     }) {
                         Text("common.share".localized)
@@ -3003,13 +3189,20 @@ struct ContentView: View {
         }
     }
 
+    /// Dropping the reference matters: the composed bitmap can be tens of MB
+    /// and this view lives as long as the tab does.
+    private func closePreview() {
+        showPreview = false
+        previewImage = nil
+    }
+
     private func shareImageWithNote() {
         showShareOptions = false
         guard let image = activeCard?.image else {
             failSharePreparation()
             return
         }
-        guard let note = tagCache[activeCard?.asset.localIdentifier ?? ""]?.note,
+        guard let note = effectiveNote(activeCard?.asset.localIdentifier ?? ""),
               !note.isEmpty else {
             presentShareSheet(items: [image])
             return
@@ -3050,7 +3243,10 @@ struct ContentView: View {
 
         let rect = CGRect(x: 0, y: 0, width: imageSize.width, height: totalHeight)
 
-        UIGraphicsBeginImageContextWithOptions(rect.size, true, 0)
+        // Render at the source image's scale (1x for PHImageManager results) so
+        // a pixel-sized card image isn't multiplied by the 2-3x screen scale
+        // into a huge bitmap.
+        UIGraphicsBeginImageContextWithOptions(rect.size, true, image.scale)
         defer { UIGraphicsEndImageContext() }
 
         UIColor(red: 0.97, green: 0.97, blue: 0.97, alpha: 1.0).setFill()
@@ -3084,12 +3280,12 @@ struct ContentView: View {
 
     private func syncNoteForCurrent() {
         guard let id = activeCard?.asset.localIdentifier else { currentNote = ""; return }
-        currentNote = tagCache[id]?.note ?? ""
+        currentNote = effectiveNote(id) ?? ""
     }
 
     private func hasNoteForCurrentAsset() -> Bool {
         guard let id = activeCard?.asset.localIdentifier else { return false }
-        return (tagCache[id]?.note?.isEmpty == false)
+        return (effectiveNote(id)?.isEmpty == false)
     }
 
     private var noteEditorOverlay: some View {
@@ -3333,7 +3529,7 @@ struct ContentView: View {
             VStack(spacing: 6) {
                 Text("goal.title")
                     .font(.title3.bold())
-                Text(String(format: "goal.subtitle".localized, storageStats.dailyPendingPeak.byteCountShort))
+                Text(String(format: "goal.subtitle".localized, storageStats.dailyMarkedBytes.byteCountShort))
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)

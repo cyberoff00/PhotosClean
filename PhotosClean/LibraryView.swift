@@ -54,10 +54,10 @@ struct LibraryView: View {
                 }
 
                 NavigationLink(
-                    destination: PhotoGridView(
+                    destination: LazyView(PhotoGridView(
                         title: "library.title".localized,
                         filterStatus: nil
-                    )
+                    ))
                 ) {
                     FolderRow(
                         title: "library.title".localized,
@@ -70,10 +70,10 @@ struct LibraryView: View {
 
                 // ✅ Move “Unmarked” right below “All Photos” for clarity
                 NavigationLink(
-                    destination: PhotoGridView(
+                    destination: LazyView(PhotoGridView(
                         title: "library.unmarked".localized,
                         filterStatus: "pending"
-                    )
+                    ))
                 ) {
                     FolderRow(
                         title: "library.unmarked".localized,
@@ -86,10 +86,10 @@ struct LibraryView: View {
 
                 Section {
                     NavigationLink(
-                        destination: PhotoGridView(
+                        destination: LazyView(PhotoGridView(
                             title: "library.favorites".localized,
                             filterStatus: "keep"
-                        )
+                        ))
                     ) {
                         FolderRow(
                             title: "library.favorites".localized,
@@ -100,10 +100,10 @@ struct LibraryView: View {
                     }
 
                     NavigationLink(
-                        destination: PhotoGridView(
+                        destination: LazyView(PhotoGridView(
                             title: "library.maybe".localized,
                             filterStatus: "maybe"
-                        )
+                        ))
                     ) {
                         FolderRow(
                             title: "library.maybe".localized,
@@ -114,10 +114,10 @@ struct LibraryView: View {
                     }
 
                     NavigationLink(
-                        destination: PhotoGridView(
+                        destination: LazyView(PhotoGridView(
                             title: "library.toDelete".localized,
                             filterStatus: "delete"
-                        )
+                        ))
                     ) {
                         FolderRow(
                             title: "library.toDelete".localized,

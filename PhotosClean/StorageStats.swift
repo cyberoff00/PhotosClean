@@ -53,11 +53,14 @@ final class StorageStats: ObservableObject {
     @AppStorage("daily_goal_bytes")    private var dailyGoalRaw: Double = Double(StorageStats.defaultGoalBytes)
     @AppStorage("goal_card_dismissed_date") private var goalCardDismissedDate: String = ""
     @AppStorage("total_bytes_cleaned") private var totalBytesCleanedRaw: Double = 0
-    /// "yyyy-MM-dd" the day the user's pending-to-release total first hit the goal.
+    /// "yyyy-MM-dd" the day the user's cumulative marked total first hit the goal.
     @AppStorage("daily_goal_hit_date") private var dailyGoalHitDate: String = ""
-    /// Peak pending-to-release bytes recorded today (sticky across deletions).
-    @AppStorage("daily_pending_peak")  private var dailyPendingPeakRaw: Double = 0
-    @AppStorage("daily_pending_peak_date") private var dailyPendingPeakDate: String = ""
+    /// Cumulative bytes/count marked-for-deletion today. Monotonic within the
+    /// day except for explicit un-marks (undo / re-categorize); actually
+    /// deleting the photos does NOT reduce it — progress must survive cleanup.
+    @AppStorage("daily_marked_bytes") private var dailyMarkedBytesRaw: Double = 0
+    @AppStorage("daily_marked_count") private var dailyMarkedCountRaw: Int = 0
+    @AppStorage("daily_marked_date")  private var dailyMarkedDate: String = ""
 
     // MARK: - In-memory cache
 
@@ -68,10 +71,7 @@ final class StorageStats: ObservableObject {
     /// have no timestamp and are treated as oldest.
     private var preciseLastTouch: [String: Date] = [:]
     private var inflightIDs: Set<String> = []
-    private var lastKnownPendingBytes: Int64 = 0
     private var widgetReloadTask: Task<Void, Never>?
-    private var pendingProgressDebounceTask: Task<Void, Never>?
-    private var pendingProgressLatestBytes: Int64 = 0
     private var saveCacheDebounceTask: Task<Void, Never>?
 
     private static let appGroupID = "group.com.claire.TastyTidy"
@@ -146,17 +146,22 @@ final class StorageStats: ObservableObject {
 
     var goalEnabled: Bool { dailyGoalBytes > 0 }
 
-    /// True once today's pending-to-release total has hit the goal at least once.
+    /// True once today's cumulative marked total has hit the goal at least once.
     var goalAchievedToday: Bool {
         guard goalEnabled else { return false }
         return dailyGoalHitDate == Self.todayString()
     }
 
-    /// Peak pending bytes recorded today. Sticky across deletions
-    /// so the celebration number doesn't drop after the user actually deletes.
-    var dailyPendingPeak: Int64 {
-        if dailyPendingPeakDate != Self.todayString() { return 0 }
-        return Int64(dailyPendingPeakRaw)
+    /// Cumulative bytes marked-for-deletion today (survives actual deletion).
+    var dailyMarkedBytes: Int64 {
+        guard dailyMarkedDate == Self.todayString() else { return 0 }
+        return Int64(dailyMarkedBytesRaw)
+    }
+
+    /// Cumulative photos marked-for-deletion today (survives actual deletion).
+    var dailyMarkedCount: Int {
+        guard dailyMarkedDate == Self.todayString() else { return 0 }
+        return dailyMarkedCountRaw
     }
 
     var shouldShowCelebrationCard: Bool {
@@ -169,50 +174,56 @@ final class StorageStats: ObservableObject {
         objectWillChange.send()
     }
 
-    /// Update sticky daily peak from the current pending-to-release total
-    /// and re-derive goal-hit state from that peak.
-    /// Debounced so rapid swipes don't trigger a UserDefaults+widget churn loop.
-    func notePendingProgress(_ pendingBytes: Int64) {
-        pendingProgressLatestBytes = pendingBytes
-        pendingProgressDebounceTask?.cancel()
-        pendingProgressDebounceTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 300_000_000)
-            guard let self, !Task.isCancelled else { return }
-            self.applyPendingProgress(self.pendingProgressLatestBytes)
+    /// Single accounting hook, called from every upsertTag. Entering "delete"
+    /// adds the asset's best-known size to today's cumulative total; leaving
+    /// "delete" (undo / re-categorize) subtracts it. Physical deletion removes
+    /// tags directly via the model context, so it never passes through here —
+    /// which is exactly what keeps the progress alive after a cleanup.
+    func noteStatusTransition(assetID: String, from oldStatus: String?, to newStatus: String) {
+        let wasDelete = oldStatus == "delete"
+        let isDelete = newStatus == "delete"
+        guard wasDelete != isDelete else { return }
+
+        let today = Self.todayString()
+        if dailyMarkedDate != today {
+            dailyMarkedBytesRaw = 0
+            dailyMarkedCountRaw = 0
+            dailyMarkedDate = today
         }
+
+        let bytes = Double(bestSize(forID: assetID))
+        if isDelete {
+            dailyMarkedBytesRaw += bytes
+            dailyMarkedCountRaw += 1
+        } else {
+            dailyMarkedBytesRaw = max(0, dailyMarkedBytesRaw - bytes)
+            dailyMarkedCountRaw = max(0, dailyMarkedCountRaw - 1)
+        }
+
+        refreshGoalHitState()
+        writeWidgetSnapshot()
+        objectWillChange.send()
     }
 
-    private func applyPendingProgress(_ pendingBytes: Int64) {
-        lastKnownPendingBytes = pendingBytes
-        let today = Self.todayString()
-        var changed = false
-
-        if dailyPendingPeakDate != today {
-            dailyPendingPeakRaw = Double(pendingBytes)
-            dailyPendingPeakDate = today
-            changed = true
-        } else if Double(pendingBytes) > dailyPendingPeakRaw {
-            dailyPendingPeakRaw = Double(pendingBytes)
-            changed = true
-        }
-
-        if refreshGoalHitState() { changed = true }
-
+    /// Re-publish the current snapshot to the widget (e.g. on appear).
+    func refreshWidgetSnapshot() {
         writeWidgetSnapshot()
-
-        if changed { objectWillChange.send() }
     }
 
     // MARK: - Widget bridge
 
     private func writeWidgetSnapshot() {
         guard let d = UserDefaults(suiteName: Self.appGroupID) else { return }
-        let remaining = max(0, dailyGoalBytes - lastKnownPendingBytes)
+        // The widget's progress is today's cumulative marked total, not the
+        // currently-pending trash size — it must not drop to zero when the
+        // user actually deletes.
+        let progressBytes = dailyMarkedBytes
+        let remaining = max(0, dailyGoalBytes - progressBytes)
         d.set(goalEnabled, forKey: "goal_enabled")
         d.set(Self.goalLabel(dailyGoalBytes), forKey: "goal_label")
-        d.set(lastKnownPendingBytes.byteCountShort, forKey: "pending_label")
+        d.set(progressBytes.byteCountShort, forKey: "pending_label")
         d.set(remaining.byteCountShort, forKey: "remaining_label")
-        d.set(NSNumber(value: lastKnownPendingBytes), forKey: "pending_bytes")
+        d.set(NSNumber(value: progressBytes), forKey: "pending_bytes")
         d.set(NSNumber(value: dailyGoalBytes), forKey: "goal_bytes")
         d.set(goalAchievedToday, forKey: "goal_hit")
         scheduleWidgetReload()
@@ -222,17 +233,19 @@ final class StorageStats: ObservableObject {
         widgetReloadTask?.cancel()
         widgetReloadTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 400_000_000)
+            // A cancelled sleep throws immediately — without this guard every
+            // cancel fires a reload right away and the debounce does nothing.
+            guard !Task.isCancelled else { return }
             WidgetCenter.shared.reloadAllTimelines()
         }
     }
 
-    /// Reconcile `dailyGoalHitDate` with today's peak vs current goal.
+    /// Reconcile `dailyGoalHitDate` with today's cumulative total vs current goal.
     /// Returns true if state changed.
     @discardableResult
     private func refreshGoalHitState() -> Bool {
         let today = Self.todayString()
-        let peakToday = (dailyPendingPeakDate == today) ? Int64(dailyPendingPeakRaw) : 0
-        let shouldBeHit = goalEnabled && peakToday >= dailyGoalBytes
+        let shouldBeHit = goalEnabled && dailyMarkedBytes >= dailyGoalBytes
         let isMarkedHit = (dailyGoalHitDate == today)
         if shouldBeHit && !isMarkedHit {
             dailyGoalHitDate = today

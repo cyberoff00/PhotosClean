@@ -72,8 +72,15 @@ private struct FrameHitchModifier: ViewModifier {
 
 extension View {
     /// Log main-thread frame hitches while this view is on screen. See `FrameHitchMonitor`.
+    /// DEBUG-only: the per-frame CADisplayLink callback plus a synchronous
+    /// `print` on already-slow frames makes release-build jank worse, not better.
+    @ViewBuilder
     func trackFrameHitches(_ tag: String) -> some View {
+        #if DEBUG
         modifier(FrameHitchModifier(tag: tag))
+        #else
+        self
+        #endif
     }
 }
 
@@ -82,6 +89,7 @@ extension View {
 /// work caused a hitch. Logs anything over ~8ms (half a 60Hz frame).
 @discardableResult
 func measureMain<T>(_ label: String, _ block: () -> T) -> T {
+    #if DEBUG
     let start = CACurrentMediaTime()
     let result = block()
     let ms = (CACurrentMediaTime() - start) * 1000.0
@@ -89,4 +97,7 @@ func measureMain<T>(_ label: String, _ block: () -> T) -> T {
         print(String(format: "⏱️📌[%@] %.1fms", label, ms))
     }
     return result
+    #else
+    return block()
+    #endif
 }

@@ -6,6 +6,27 @@ import AVKit
 import UIKit
 import UniformTypeIdentifiers
 
+/// Lazily-built assetID → index map. Creating the holder is O(1); the O(N)
+/// build runs once, on first access, only inside the @State instance SwiftUI
+/// keeps — not on every re-init of the view struct.
+private final class AssetOrderIndex {
+    private let assets: [PHAsset]
+    private var cached: [String: Int]?
+
+    init(assets: [PHAsset]) { self.assets = assets }
+
+    var map: [String: Int] {
+        if let cached { return cached }
+        var m: [String: Int] = [:]
+        m.reserveCapacity(assets.count)
+        for (idx, asset) in assets.enumerated() where m[asset.localIdentifier] == nil {
+            m[asset.localIdentifier] = idx
+        }
+        cached = m
+        return m
+    }
+}
+
 // MARK: - Main View
 struct RetroCleanView: View {
 
@@ -34,7 +55,8 @@ struct RetroCleanView: View {
     // Detached, un-persisted tag edits made during this swipe session. See
     // upsertTag / commitPendingTags for why writes are batched off the swipe path.
     @State private var pendingTags: [String: PhotoTag] = [:]
-    @State private var assetOrderByID: [String: Int] = [:]
+    @State private var orderIndex: AssetOrderIndex
+    private var assetOrderByID: [String: Int] { orderIndex.map }
     // Throttled SwiftData save: coalesce per-swipe writes into one save (~0.6s
     // after the last change), with a forced flush on disappear/background.
     @State private var pendingTagSave: DispatchWorkItem?
@@ -58,7 +80,11 @@ struct RetroCleanView: View {
     @State private var currentVideoUpgradeRequestID: PHImageRequestID = PHInvalidImageRequestID
     @State private var videoEndObserver: NSObjectProtocol?
     @State private var videoCloudProgress: Double? = nil
-    private let imageManager = PHCachingImageManager()
+    /// One app-lifetime caching manager (same rationale as ContentView): this is
+    /// a struct SwiftUI keeps recreating, so a per-instance manager would lose
+    /// its warm cache and make saved request IDs un-cancelable on the new instance.
+    private static let sharedImageManager = PHCachingImageManager()
+    private var imageManager: PHCachingImageManager { Self.sharedImageManager }
 
     // Drag
     @GestureState private var dragOffset: CGSize = .zero
@@ -99,13 +125,12 @@ struct RetroCleanView: View {
         } else {
             safeInitialID = assets.first?.localIdentifier ?? ""
         }
-        var orderByID: [String: Int] = [:]
-        orderByID.reserveCapacity(assets.count)
-        for (idx, asset) in assets.enumerated() where orderByID[asset.localIdentifier] == nil {
-            orderByID[asset.localIdentifier] = idx
-        }
         self._currentAssetID = State(initialValue: safeInitialID)
-        self._assetOrderByID = State(initialValue: orderByID)
+        // O(1) here on purpose: this init re-runs every time the parent's
+        // navigationDestination closure re-evaluates (every grid body pass while
+        // Retro is on top). The O(N) index build happens lazily, once, inside
+        // the single holder instance SwiftUI actually keeps.
+        self._orderIndex = State(initialValue: AssetOrderIndex(assets: assets))
     }
 
     private var currentIndex: Int? {
@@ -478,6 +503,14 @@ struct RetroCleanView: View {
     private func commitSwipeAndAdvance(status: String, from t: CGSize, predicted: CGSize) {
         guard !isUndoRestoring else { return }
         guard let card = activeCard else { return }
+        // Daily quota gate at the single commit entry, mirroring ContentView:
+        // recordSwipe is a no-op for premium; when the quota is exhausted the
+        // swipe must NOT commit, otherwise free users bypass the paywall here.
+        guard paywallGate.recordSwipe(isPremium: storeManager.hasUnlockedPremium) else {
+            if !paywallGate.showPaywall { paywallGate.showPaywall = true }
+            return
+        }
+        SwipeFeedback.shared.swipe(status: status)
         isAnimatingOut = true
 
         settleOffset = t
@@ -510,22 +543,15 @@ struct RetroCleanView: View {
                 self.imageManager.cancelImageRequest(reqID)
             }
 
-            self.upsertTag(assetID: assetID) { tag in
-                tag.status = status
-                tag.createdAt = Date()
-            }
-
+            // Size estimate must be cached before the tag transition so the
+            // daily cumulative progress adds a non-zero amount.
             if status == "delete" {
                 self.storageStats.noteAsset(card.asset)
             }
 
-            self.paywallGate.recordSwipe(isPremium: self.storeManager.hasUnlockedPremium)
-
-            // Hard wall: auto-present the paywall the moment the daily free quota runs out.
-            if !self.storeManager.hasUnlockedPremium,
-               self.paywallGate.isQuotaExhausted,
-               !self.paywallGate.showPaywall {
-                self.paywallGate.showPaywall = true
+            self.upsertTag(assetID: assetID) { tag in
+                tag.status = status
+                tag.createdAt = Date()
             }
 
             self.stopAllMedia()
@@ -1469,14 +1495,14 @@ struct RetroCleanView: View {
         ZStack {
             Color.black.opacity(0.5)
                 .ignoresSafeArea()
-                .onTapGesture { showPreview = false }
+                .onTapGesture { closePreview() }
 
             VStack(spacing: 20) {
                 HStack {
                     Text("common.preview".localized)
                         .font(.system(size: 18, weight: .semibold))
                     Spacer()
-                    Button(action: { showPreview = false }) {
+                    Button(action: { closePreview() }) {
                         Image(systemName: "xmark")
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.secondary)
@@ -1493,7 +1519,7 @@ struct RetroCleanView: View {
                 }
 
                 HStack(spacing: 12) {
-                    Button(action: { showPreview = false }) {
+                    Button(action: { closePreview() }) {
                         Text("common.cancel".localized)
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.primary)
@@ -1504,7 +1530,7 @@ struct RetroCleanView: View {
                     }
 
                     Button(action: {
-                        showPreview = false
+                        closePreview()
                         presentShareSheet(items: [image])
                     }) {
                         Text("common.share".localized)
@@ -1577,6 +1603,12 @@ struct RetroCleanView: View {
                 }
             }
         }
+    }
+
+    /// Dropping the reference matters: the composed bitmap can be tens of MB.
+    private func closePreview() {
+        showPreview = false
+        previewImage = nil
     }
 
     private func shareImageWithNote() {
@@ -1725,10 +1757,12 @@ struct RetroCleanView: View {
             scratch = PhotoTag(assetID: assetID, status: tagCache[assetID]?.status ?? "pending")
             scratch.note = tagCache[assetID]?.note
         }
+        let oldStatus = scratch.status
         scratch.createdAt = Date()
         mutate(scratch)
         pendingTags[assetID] = scratch
         scheduleTagSave()
+        storageStats.noteStatusTransition(assetID: assetID, from: oldStatus, to: scratch.status)
     }
 
     private func scheduleTagSave() {

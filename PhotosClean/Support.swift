@@ -9,6 +9,17 @@ import Photos
 import AVKit
 import UIKit
 import PhotosUI
+
+/// Defers building the wrapped view until it's actually rendered. NavigationLink
+/// evaluates its `destination:` argument on every body pass of the enclosing
+/// view, so an unwrapped PhotoGridView gets fully re-inited (Timer publisher,
+/// state storage, …) for every visible link whenever counts/tags change.
+struct LazyView<Content: View>: View {
+    let build: () -> Content
+    init(_ build: @autoclosure @escaping () -> Content) { self.build = build }
+    var body: some View { build() }
+}
+
 /// PHLivePhotoView that only begins playback once it has a non-zero layout.
 /// `startPlayback(with:)` captures the view geometry at the moment it's called,
 /// so starting it while SwiftUI hasn't laid the view out yet (bounds == .zero)

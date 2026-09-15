@@ -134,8 +134,13 @@ struct PhotoGridView: View {
     private let autoScrollEdge: CGFloat = 70
     private let autoScrollStep: Int = 2
     private let autoScrollTimer = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
-    private let blurCIContext = CIContext(options: nil)
-    private let blurRenderColorSpace = CGColorSpaceCreateDeviceRGB()
+    // static: this struct is re-created on every parent body pass and a
+    // Metal-backed CIContext is expensive to build; one app-lifetime context
+    // is fine because CIContext is thread-safe.
+    private static let sharedBlurCIContext = CIContext(options: nil)
+    private static let sharedBlurRenderColorSpace = CGColorSpaceCreateDeviceRGB()
+    private var blurCIContext: CIContext { Self.sharedBlurCIContext }
+    private var blurRenderColorSpace: CGColorSpace { Self.sharedBlurRenderColorSpace }
 
     // ✅ 待删除资产/体积缓存：只在 allTags / allAssetsSnapshot 变化时重算一次，
     // body 渲染只读缓存（之前每次 body 都全库 O(N) 过滤 + 体积统计）。
@@ -1110,11 +1115,16 @@ struct PhotoGridView: View {
 
     private func selectAIFilter(_ cat: AICleanCategory) {
         selectedAICategory = cat
-        // 截图：直接从当前 assets 快速计算（不需要额外扫描）
+        // 截图：直接从当前 assets 快速计算（不需要额外扫描）。
+        // mediaSubtypes 是逐个 ObjC 调用，全库 O(N) 放后台，主线程只收结果。
         if cat == .screenshots {
-            aiScreenshotsIDs = Set(assets.filter {
-                ($0.mediaSubtypes.contains(.photoScreenshot))
-            }.map { $0.localIdentifier })
+            let snapshot = assets
+            Task.detached(priority: .userInitiated) {
+                let ids = Set(snapshot.filter {
+                    $0.mediaSubtypes.contains(.photoScreenshot)
+                }.map { $0.localIdentifier })
+                await MainActor.run { aiScreenshotsIDs = ids }
+            }
             return
         }
 
@@ -1147,7 +1157,12 @@ struct PhotoGridView: View {
 
         aiIsScanning = true
 
-        let sorted = sortedAssetsByDateDesc()
+        // Sorting tens of thousands of PHAssets is two ObjC property calls per
+        // comparison — run it off main so the progress overlay can render first.
+        let snapshot = assets
+        let sorted = await Task.detached(priority: .userInitiated) {
+            Self.sortedByDateDesc(snapshot)
+        }.value
         let (batch, start, end) = nextBatch(for: cat, sortedAssets: sorted)
         guard !batch.isEmpty else {
             aiIsScanning = false
@@ -1179,7 +1194,7 @@ struct PhotoGridView: View {
         aiProgressText = nil
     }
 
-    private func sortedAssetsByDateDesc() -> [PHAsset] {
+    nonisolated private static func sortedByDateDesc(_ assets: [PHAsset]) -> [PHAsset] {
         // assets 本来就是按 creationDate desc 取出来的；这里再保险排序一次
         assets.sorted { ($0.creationDate ?? .distantPast) > ($1.creationDate ?? .distantPast) }
     }

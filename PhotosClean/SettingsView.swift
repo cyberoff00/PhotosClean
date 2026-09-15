@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var showFreedExplanation = false
     @State private var showFeedback = false
     @AppStorage("prewarm_use_cellular") private var prewarmUseCellular: Bool = true
+    @AppStorage(SwipeSoundStyle.storageKey) private var swipeSoundRaw: String = SwipeSoundStyle.off.rawValue
     #if DEBUG
     @AppStorage("debug_simulate_delete_drop") private var debugSimulateDeleteDrop: Bool = false
     #endif
@@ -48,7 +49,7 @@ struct SettingsView: View {
                     HStack {
                         Label("settings.cleanup.today".localized, systemImage: "chart.bar.fill")
                         Spacer()
-                        Text("\(storageStats.dailyPendingPeak.byteCountShort) / \(StorageStats.goalLabel(storageStats.dailyGoalBytes))")
+                        Text("\(String(format: "settings.cleanup.today.count".localized, storageStats.dailyMarkedCount)) · \(storageStats.dailyMarkedBytes.byteCountShort) / \(StorageStats.goalLabel(storageStats.dailyGoalBytes))")
                             .foregroundColor(storageStats.goalAchievedToday ? .green : .secondary)
                             .font(.caption.monospacedDigit())
                     }
@@ -78,6 +79,20 @@ struct SettingsView: View {
                 Text("settings.download.section".localized)
             } footer: {
                 Text("settings.prewarm.cellular.footer".localized)
+            }
+
+            Section {
+                Picker(selection: swipeSoundBinding) {
+                    ForEach(SwipeSoundStyle.allCases) { style in
+                        Text(style.label).tag(style)
+                    }
+                } label: {
+                    Label("settings.sound.title".localized, systemImage: "speaker.wave.2")
+                }
+            } header: {
+                Text("settings.sound.section".localized)
+            } footer: {
+                Text("settings.sound.footer".localized)
             }
 
             Section("settings.general.section".localized) {
@@ -132,6 +147,16 @@ struct SettingsView: View {
         .sheet(isPresented: $showFeedback) {
             FeedbackView()
         }
+    }
+
+    private var swipeSoundBinding: Binding<SwipeSoundStyle> {
+        Binding(
+            get: { SwipeSoundStyle.current() },
+            set: { style in
+                swipeSoundRaw = style.rawValue
+                SwipeFeedback.shared.preview(style: style)
+            }
+        )
     }
 
     private var goalBinding: Binding<Int64> {

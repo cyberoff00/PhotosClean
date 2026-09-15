@@ -37,6 +37,8 @@
 "library.maybe" = "待定";
 "library.toDelete" = "待删除";
 "library.retroView" = "图库";
+"library.done" = "完成";
+"library.finished" = "这一组已经刷完啦";
 
 /* PhotoGridView */
 "grid.noPhotos" = "无照片";
@@ -265,8 +267,19 @@
 "settings.cleanup.daily_goal" = "每日目标";
 "settings.cleanup.goal_off" = "关闭";
 "settings.cleanup.today" = "今日进度";
+"settings.cleanup.today.count" = "%d 张";
 "settings.cleanup.total" = "累计已清理";
 "settings.cleanup.total.explain" = "iOS 会把删除的照片保留在「最近删除」相册 30 天。要真正释放存储空间，请打开系统相册，进入「最近删除」并清空。";
+
+/* 滑动音效 */
+"settings.sound.section" = "滑动反馈";
+"settings.sound.title" = "音效";
+"settings.sound.off" = "关闭";
+"settings.sound.bubble" = "气泡";
+"settings.sound.click" = "轻点";
+"settings.sound.glass" = "清脆";
+"settings.sound.mech" = "咔哒";
+"settings.sound.footer" = "连续快速滑动时音调会一级级升高，停顿后回落；删除方向固定是「嗖」的一声。";
 "common.ok" = "好";
 "common.close" = "关闭";
 
@@ -316,4 +329,5 @@
 "library.card.loadFailed" = "无法加载此项目";
 "common.tapToRetry" = "点按重试";
 "library.limited.notice" = "应用目前仅能访问你选择的部分照片，统计数量可能不完整。";
+"random.limited.notice" = "仅能访问你选择的部分照片，随机日期范围有限。到系统设置开放「完全访问」可随机整个相册。";
 "library.limited.manage" = "管理所选照片";

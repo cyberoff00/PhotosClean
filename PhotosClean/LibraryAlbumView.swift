@@ -4,6 +4,7 @@ import PhotosUI
 import SwiftData
 import AVKit
 import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - CardState
 struct CardState: Identifiable {
@@ -43,6 +44,12 @@ struct LibraryCleanView: View {
     private let keepWindowRadius = 6
 
     @State private var tagCache: [String: PhotoTag] = [:]
+    // Detached scratch edits accumulated between saves — see upsertTag /
+    // commitPendingTags in RetroCleanView for why writes are batched off the
+    // tap path (every save re-fires the live @Query of the grid sitting right
+    // below this view in the navigation stack, an O(N) main-thread cascade).
+    @State private var pendingTags: [String: PhotoTag] = [:]
+    @State private var pendingTagSave: DispatchWorkItem?
 
     @State private var livePhoto: PHLivePhoto?
     @State private var isPlayingLivePhoto = false
@@ -59,7 +66,11 @@ struct LibraryCleanView: View {
     @State private var videoRequestIDs: [String: PHImageRequestID] = [:]
     @State private var inFlightVideoIDs: Set<String> = []
     @State private var videoEndObserver: NSObjectProtocol?
-    private let imageManager = PHCachingImageManager()
+    /// One app-lifetime caching manager (same rationale as ContentView): this is
+    /// a struct SwiftUI keeps recreating, so a per-instance manager would lose
+    /// its warm cache and make saved request IDs un-cancelable on the new instance.
+    private static let sharedImageManager = PHCachingImageManager()
+    private var imageManager: PHCachingImageManager { Self.sharedImageManager }
 
     @GestureState private var dragOffset: CGSize = .zero
     @State private var settleOffset: CGSize = .zero
@@ -78,6 +89,7 @@ struct LibraryCleanView: View {
     /// Guards the "share original" flow: blocks duplicate taps and drives the
     /// loading overlay while the full-size data is being fetched (maybe iCloud).
     @State private var isSharePreparing = false
+    @State private var shareFailedVisible = false
     
     @State private var isAnimatingOut = false
     private var isInteractionHeavyPhase: Bool { (dragOffset != .zero) || isAnimatingOut }
@@ -156,6 +168,21 @@ struct LibraryCleanView: View {
                         .cornerRadius(12)
                 }
             }
+
+            if shareFailedVisible {
+                VStack {
+                    Text("share.failed".localized)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.regularMaterial)
+                        .cornerRadius(10)
+                        .padding(.top, 8)
+                    Spacer()
+                }
+                .transition(.opacity)
+            }
         }
         .onAppear {
             cleanLog("[Lib] onAppear START assets=\(assets.count) index=\(index)")
@@ -169,6 +196,13 @@ struct LibraryCleanView: View {
             stopAllMedia()
             cancelAllVideoRequests()
             cancelAllCardRequests()
+            flushPendingTagSave()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            flushPendingTagSave()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            flushPendingTagSave()
         }
         .onChange(of: index) { _, _ in
             stopAllMedia()
@@ -479,7 +513,7 @@ struct LibraryCleanView: View {
     // MARK: - Classification
     private var currentStatus: String? {
         guard let id = currentAssetID else { return nil }
-        let s = tagCache[id]?.status
+        let s = effectiveStatus(id)
         if s == nil || s == "pending" { return nil }
         return s
     }
@@ -523,7 +557,7 @@ struct LibraryCleanView: View {
             return
         }
 
-        let raw = tagCache[id]?.status
+        let raw = effectiveStatus(id)
         let current: String? = (raw == nil || raw == "pending") ? nil : raw
 
         let next: String
@@ -538,12 +572,14 @@ struct LibraryCleanView: View {
             }
         }
 
-        upsertTag(assetID: id) { tag in
-            tag.status = next
-        }
-
+        // Size estimate must be cached before the tag transition so the
+        // daily cumulative progress adds a non-zero amount.
         if next == "delete", let asset = currentAsset {
             storageStats.noteAsset(asset)
+        }
+
+        upsertTag(assetID: id) { tag in
+            tag.status = next
         }
 
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -660,7 +696,19 @@ struct LibraryCleanView: View {
                 if !degraded { completion(nil, false) }
                 return
             }
-            completion(CardState(asset: asset, image: img), degraded)
+            if degraded {
+                completion(CardState(asset: asset, image: img), true)
+            } else {
+                // Full image: force-decode off the main thread. PHImageManager
+                // hands back an undecoded image, so the first Image(uiImage:)
+                // render would otherwise decode the full bitmap ON THE MAIN
+                // THREAD — the same swipe stalls Retro measured and fixed.
+                img.prepareForDisplay { decoded in
+                    DispatchQueue.main.async {
+                        completion(CardState(asset: asset, image: decoded ?? img), false)
+                    }
+                }
+            }
         }
     }
 
@@ -1064,12 +1112,12 @@ struct LibraryCleanView: View {
 
     private func syncNoteForCurrent() {
         guard let id = currentAssetID else { currentNote = ""; return }
-        currentNote = tagCache[id]?.note ?? ""
+        currentNote = effectiveNote(id) ?? ""
     }
 
     private func hasNoteForCurrentAsset() -> Bool {
         guard let id = currentAssetID else { return false }
-        return tagCache[id]?.note?.isEmpty == false
+        return effectiveNote(id)?.isEmpty == false
     }
 
     // MARK: - Share Options
@@ -1141,9 +1189,16 @@ struct LibraryCleanView: View {
             opt.isNetworkAccessAllowed = true
             PHImageManager.default().requestAVAsset(forVideo: asset, options: opt) { av, _, _ in
                 DispatchQueue.main.async {
-                    self.isSharePreparing = false
-                    guard let url = (av as? AVURLAsset)?.url else { return }
-                    presentShareSheet(items: [url])
+                    if let url = (av as? AVURLAsset)?.url {
+                        self.isSharePreparing = false
+                        presentShareSheet(items: [url])
+                    } else if av != nil {
+                        // AVComposition (slo-mo etc.) has no file URL — export the
+                        // original video resource to a temp file instead.
+                        self.exportVideoResourceAndShare(asset: asset)
+                    } else {
+                        self.failSharePreparation()
+                    }
                 }
             }
         } else {
@@ -1154,25 +1209,83 @@ struct LibraryCleanView: View {
             opt.isNetworkAccessAllowed = true
             opt.deliveryMode = .highQualityFormat
             opt.version = .current
-            PHImageManager.default().requestImageDataAndOrientation(for: asset, options: opt) { data, _, _, _ in
-                DispatchQueue.main.async {
-                    self.isSharePreparing = false
-                    if let data, let image = UIImage(data: data) {
-                        presentShareSheet(items: [image])
-                    } else if let fallback = self.currentCard?.image {
-                        // iCloud fetch failed — fall back to the on-screen image
-                        // rather than doing nothing.
-                        presentShareSheet(items: [fallback])
+            PHImageManager.default().requestImageDataAndOrientation(for: asset, options: opt) { data, dataUTI, _, _ in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    // Write the untouched original bytes to a temp file so the
+                    // share sheet gets the real full-quality photo without ever
+                    // decoding the full-resolution bitmap into memory.
+                    var item: Any?
+                    if let data {
+                        let ext = dataUTI.flatMap { UTType($0)?.preferredFilenameExtension } ?? "jpg"
+                        let url = FileManager.default.temporaryDirectory
+                            .appendingPathComponent(UUID().uuidString)
+                            .appendingPathExtension(ext)
+                        if (try? data.write(to: url)) != nil { item = url }
+                    }
+                    DispatchQueue.main.async {
+                        if let item {
+                            self.isSharePreparing = false
+                            presentShareSheet(items: [item])
+                        } else if let fallback = self.currentCard?.image {
+                            // iCloud fetch failed — fall back to the on-screen image
+                            // rather than doing nothing.
+                            self.isSharePreparing = false
+                            presentShareSheet(items: [fallback])
+                        } else {
+                            self.failSharePreparation()
+                        }
                     }
                 }
             }
         }
     }
 
+    /// Slo-mo / edited videos come back as AVComposition. Write the underlying
+    /// video resource to a temp file so the share sheet gets a real URL.
+    private func exportVideoResourceAndShare(asset: PHAsset) {
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard let resource = resources.first(where: { $0.type == .fullSizeVideo })
+                ?? resources.first(where: { $0.type == .video }) else {
+            failSharePreparation()
+            return
+        }
+        var ext = (resource.originalFilename as NSString).pathExtension
+        if ext.isEmpty { ext = "mov" }
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(ext)
+        let opt = PHAssetResourceRequestOptions()
+        opt.isNetworkAccessAllowed = true
+        PHAssetResourceManager.default().writeData(for: resource, toFile: tempURL, options: opt) { error in
+            DispatchQueue.main.async {
+                if error == nil {
+                    self.isSharePreparing = false
+                    presentShareSheet(items: [tempURL])
+                } else {
+                    self.failSharePreparation()
+                }
+            }
+        }
+    }
+
+    private func failSharePreparation() {
+        isSharePreparing = false
+        shareFailedVisible = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            shareFailedVisible = false
+        }
+    }
+
+    /// Dropping the reference matters: the composed bitmap can be tens of MB.
+    private func closePreview() {
+        showPreview = false
+        previewImage = nil
+    }
+
     private func shareImageWithNote() {
         showShareOptions = false
         guard let image = currentCard?.image,
-              let note = tagCache[currentAssetID ?? ""]?.note,
+              let note = effectiveNote(currentAssetID ?? ""),
               !note.isEmpty else {
             presentShareSheet(items: [currentCard?.image ?? UIImage()])
             return
@@ -1215,7 +1328,10 @@ struct LibraryCleanView: View {
 
         let rect = CGRect(x: 0, y: 0, width: imageSize.width, height: totalHeight)
 
-        UIGraphicsBeginImageContextWithOptions(rect.size, true, 0)
+        // Render at the source image's scale (1x for PHImageManager results) so
+        // a pixel-sized card image isn't multiplied by the 2-3x screen scale
+        // into a huge bitmap.
+        UIGraphicsBeginImageContextWithOptions(rect.size, true, image.scale)
         defer { UIGraphicsEndImageContext() }
 
         
@@ -1269,14 +1385,14 @@ struct LibraryCleanView: View {
         ZStack {
             Color.black.opacity(0.5)
                 .ignoresSafeArea()
-                .onTapGesture { showPreview = false }
+                .onTapGesture { closePreview() }
 
             VStack(spacing: 20) {
                 HStack {
                     Text("common.preview".localized)
                         .font(.system(size: 18, weight: .semibold))
                     Spacer()
-                    Button(action: { showPreview = false }) {
+                    Button(action: { closePreview() }) {
                         Image(systemName: "xmark")
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.secondary)
@@ -1293,7 +1409,7 @@ struct LibraryCleanView: View {
                 }
 
                 HStack(spacing: 12) {
-                    Button(action: { showPreview = false }) {
+                    Button(action: { closePreview() }) {
                         Text("common.cancel".localized)
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundColor(.primary)
@@ -1304,7 +1420,7 @@ struct LibraryCleanView: View {
                     }
 
                     Button(action: {
-                        showPreview = false
+                        closePreview()
                         presentShareSheet(items: [image])
                     }) {
                         Text("common.share".localized)
@@ -1336,19 +1452,70 @@ struct LibraryCleanView: View {
         tagCache = map
     }
 
-    private func upsertTag(assetID: String, mutate: (PhotoTag) -> Void) {
-        let tag: PhotoTag
-        if let existing = tagCache[assetID] {
-            tag = existing
-        } else {
-            tag = PhotoTag(assetID: assetID, status: "pending")
-            tag.createdAt = Date()
-            modelContext.insert(tag)
-            tagCache[assetID] = tag
-        }
+    private func effectiveStatus(_ assetID: String) -> String? {
+        if let pending = pendingTags[assetID] { return pending.status }
+        return tagCache[assetID]?.status
+    }
 
-        mutate(tag)
+    private func effectiveNote(_ assetID: String) -> String? {
+        if let pending = pendingTags[assetID] { return pending.note }
+        return tagCache[assetID]?.note
+    }
+
+    private func upsertTag(assetID: String, mutate: (PhotoTag) -> Void) {
+        // Seed a detached scratch with the current effective state so a
+        // status-only edit preserves the note (and vice-versa).
+        let scratch: PhotoTag
+        if let pending = pendingTags[assetID] {
+            scratch = pending
+        } else {
+            scratch = PhotoTag(assetID: assetID, status: tagCache[assetID]?.status ?? "pending")
+            scratch.note = tagCache[assetID]?.note
+        }
+        let oldStatus = scratch.status
+        scratch.createdAt = Date()
+        mutate(scratch)
+        pendingTags[assetID] = scratch
+        scheduleTagSave()
+        storageStats.noteStatusTransition(assetID: assetID, from: oldStatus, to: scratch.status)
+    }
+
+    private func scheduleTagSave() {
+        pendingTagSave?.cancel()
+        let work = DispatchWorkItem {
+            self.pendingTagSave = nil
+            self.commitPendingTags()
+        }
+        pendingTagSave = work
+        // Long debounce: a burst of taps keeps rescheduling this, so the
+        // context is only dirtied once the user genuinely pauses.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+    }
+
+    private func flushPendingTagSave() {
+        pendingTagSave?.cancel()
+        pendingTagSave = nil
+        commitPendingTags()
+    }
+
+    /// Apply every accumulated edit to the context in one batch and save once.
+    /// This is the only place this view dirties the shared context.
+    private func commitPendingTags() {
+        guard !pendingTags.isEmpty else { return }
+        for (id, scratch) in pendingTags {
+            let tag: PhotoTag
+            if let existing = tagCache[id] {
+                tag = existing
+            } else {
+                tag = PhotoTag(assetID: id, status: scratch.status)
+                modelContext.insert(tag)
+            }
+            tag.status = scratch.status
+            tag.note = scratch.note
+            tag.createdAt = scratch.createdAt
+            tagCache[id] = tag
+        }
+        pendingTags.removeAll()
         try? modelContext.save()
-        tagCache[assetID] = tag
     }
 }

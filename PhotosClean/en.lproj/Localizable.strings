@@ -43,6 +43,8 @@
 "library.maybe" = "Maybe";
 "library.toDelete" = "To Delete";
 "library.retroView" = "Library";
+"library.done" = "Done";
+"library.finished" = "You've finished reviewing this group";
 
 /* PhotoGridView */
 "grid.noPhotos" = "No Photos";
@@ -295,8 +297,19 @@
 "settings.cleanup.daily_goal" = "Daily Goal";
 "settings.cleanup.goal_off" = "Off";
 "settings.cleanup.today" = "Today's progress";
+"settings.cleanup.today.count" = "%d photos";
 "settings.cleanup.total" = "All-time freed";
 "settings.cleanup.total.explain" = "iOS keeps deleted photos in Recently Deleted for 30 days. To actually reclaim storage, open the Photos app and empty the Recently Deleted album.";
+
+/* Swipe sound */
+"settings.sound.section" = "Swipe Feedback";
+"settings.sound.title" = "Sound";
+"settings.sound.off" = "Off";
+"settings.sound.bubble" = "Bubble";
+"settings.sound.click" = "Click";
+"settings.sound.glass" = "Glass";
+"settings.sound.mech" = "Clunk";
+"settings.sound.footer" = "Pitch climbs step by step as you keep swiping, and resets after a pause. The delete direction always whooshes.";
 "common.ok" = "OK";
 "common.close" = "Close";
 
@@ -346,4 +359,5 @@
 "library.card.loadFailed" = "Couldn't load this item";
 "common.tapToRetry" = "Tap to retry";
 "library.limited.notice" = "TastyTidy can only access the photos you've selected, so counts may be incomplete.";
+"random.limited.notice" = "Only your selected photos are accessible, so random days are limited. Allow Full Access in Settings to shuffle your whole library.";
 "library.limited.manage" = "Manage Selected Photos";
